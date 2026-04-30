@@ -1,0 +1,211 @@
+import type { LocalProject, SessionRecord } from "../types";
+import type { IdentityAsset } from "./identityViewModel";
+
+export type ProjectSessionSelection =
+  | { kind: "all" }
+  | { kind: "identity"; identityKey: string }
+  | { kind: "project"; identityKey: string; projectId: number }
+  | { kind: "session"; identityKey: string; projectId: number; sessionId: number };
+
+export type ProjectSessionIdentityGroup = {
+  key: string;
+  label: string;
+  subtitle: string;
+  kindLabel: string;
+  sessionCount: number;
+  projectCount: number;
+  projects: ProjectSessionProjectGroup[];
+};
+
+export type ProjectSessionProjectGroup = {
+  id: number;
+  name: string;
+  path: string;
+  updatedAt: string;
+  sessions: SessionRecord[];
+};
+
+export type ProjectSessionScope = {
+  identity: ProjectSessionIdentityGroup;
+  project: ProjectSessionProjectGroup;
+};
+
+const UNNAMED_CODEX_SESSION_TITLES = new Set(["", "未命名会话", "未命名 Codex 会话"]);
+
+function fallbackProject(record: SessionRecord): LocalProject {
+  return {
+    id: record.project_id,
+    name: record.project_name,
+    workspace_path: record.project_path,
+    git_remote: null,
+    last_active_at: record.updated_at,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+  };
+}
+
+function isUnnamedCodexSessionTitle(title: string) {
+  return UNNAMED_CODEX_SESSION_TITLES.has(title.trim());
+}
+
+export function displaySessionTitle(record: SessionRecord) {
+  if (!isUnnamedCodexSessionTitle(record.title)) {
+    return record.title.trim();
+  }
+
+  const projectName = record.project_name?.trim() || "Codex 会话";
+  const updatedAt = record.updated_at?.trim();
+  if (updatedAt) {
+    return `${projectName} · ${updatedAt}`;
+  }
+  if (record.message_count > 0) {
+    return `${projectName} · ${record.message_count} 条消息`;
+  }
+  return `${projectName} · Codex 会话`;
+}
+
+export function sessionIdentityKey(record: SessionRecord) {
+  if (record.owner_profile_kind === "official_account" && record.owner_account_id) {
+    return `account:${record.owner_account_id}`;
+  }
+  if (record.owner_profile_kind === "third_party_key") {
+    return record.owner_profile_ref.startsWith("key:")
+      ? record.owner_profile_ref
+      : `key:${record.owner_profile_ref}`;
+  }
+  return `${record.owner_profile_kind}:${record.owner_profile_ref}`;
+}
+
+function identityLabel(key: string, assets: IdentityAsset[]) {
+  const asset = assets.find((item) => item.id === key);
+  if (asset?.kind === "official_account") {
+    return {
+      label: asset.title,
+      subtitle: asset.subtitle,
+      kindLabel: "官方账号",
+    };
+  }
+  if (asset?.kind === "third_party_key") {
+    return {
+      label: asset.title,
+      subtitle: [asset.profile.provider, asset.profile.model].filter(Boolean).join(" · ") || "第三方 Key",
+      kindLabel: "Key",
+    };
+  }
+  if (key === "local_codex:local") {
+    return {
+      label: "本地 Codex 导入",
+      subtitle: "未绑定账号/Key",
+      kindLabel: "未绑定",
+    };
+  }
+  return {
+    label: key,
+    subtitle: "未知身份来源",
+    kindLabel: "其他",
+  };
+}
+
+export function buildProjectSessionGroups({
+  identityAssets,
+  localProjects,
+  sessionRecords,
+}: {
+  identityAssets: IdentityAsset[];
+  localProjects: LocalProject[];
+  sessionRecords: SessionRecord[];
+}): ProjectSessionIdentityGroup[] {
+  const projectById = new Map(localProjects.map((project) => [project.id, project]));
+  const grouped = new Map<string, Map<number, SessionRecord[]>>();
+
+  for (const record of sessionRecords) {
+    const identityKey = sessionIdentityKey(record);
+    const projects = grouped.get(identityKey) ?? new Map<number, SessionRecord[]>();
+    const sessions = projects.get(record.project_id) ?? [];
+    sessions.push(record);
+    projects.set(record.project_id, sessions);
+    grouped.set(identityKey, projects);
+  }
+
+  return [...grouped.entries()]
+    .map(([identityKey, projects]) => {
+      const label = identityLabel(identityKey, identityAssets);
+      const projectGroups = [...projects.entries()]
+        .map(([projectId, sessions]) => {
+          const project = projectById.get(projectId) ?? fallbackProject(sessions[0]);
+          const sortedSessions = [...sessions].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+          return {
+            id: project.id,
+            name: project.name,
+            path: project.workspace_path,
+            updatedAt: project.last_active_at ?? project.updated_at,
+            sessions: sortedSessions,
+          };
+        })
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+
+      return {
+        key: identityKey,
+        label: label.label,
+        subtitle: label.subtitle,
+        kindLabel: label.kindLabel,
+        sessionCount: projectGroups.reduce((total, project) => total + project.sessions.length, 0),
+        projectCount: projectGroups.length,
+        projects: projectGroups,
+      };
+    })
+    .sort((left, right) => {
+      if (left.key === "local_codex:local") return 1;
+      if (right.key === "local_codex:local") return -1;
+      return right.sessionCount - left.sessionCount || left.label.localeCompare(right.label, "zh-Hans-CN");
+    });
+}
+
+export function sessionsForProjectSelection(
+  groups: ProjectSessionIdentityGroup[],
+  selection: ProjectSessionSelection,
+) {
+  if (selection.kind === "all") {
+    return groups.flatMap((identity) => identity.projects.flatMap((project) => project.sessions));
+  }
+
+  const identity = groups.find((item) => item.key === selection.identityKey);
+  if (!identity) return [];
+
+  if (selection.kind === "identity") {
+    return identity.projects.flatMap((project) => project.sessions);
+  }
+
+  const project = identity.projects.find((item) => item.id === selection.projectId);
+  if (!project) return [];
+
+  if (selection.kind === "project") {
+    return project.sessions;
+  }
+
+  return project.sessions.filter((session) => session.id === selection.sessionId);
+}
+
+export function buildProjectSessionScopeBySessionId(groups: ProjectSessionIdentityGroup[]) {
+  const lookup = new Map<number, ProjectSessionScope>();
+  for (const identity of groups) {
+    for (const project of identity.projects) {
+      for (const session of project.sessions) {
+        lookup.set(session.id, { identity, project });
+      }
+    }
+  }
+  return lookup;
+}
+
+export function selectedProjectSessionTitle(selection: ProjectSessionSelection, groups: ProjectSessionIdentityGroup[]) {
+  if (selection.kind === "all") return "全部项目会话";
+  const identity = groups.find((item) => item.key === selection.identityKey);
+  if (!identity) return "项目会话";
+  if (selection.kind === "identity") return identity.label;
+  const project = identity.projects.find((item) => item.id === selection.projectId);
+  if (!project) return identity.label;
+  if (selection.kind === "project") return project.name;
+  const session = project.sessions.find((item) => item.id === selection.sessionId);
+  return session ? displaySessionTitle(session) : "项目会话";
+}

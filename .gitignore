@@ -1,0 +1,45 @@
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local agent / planning state
+.claude/
+.superpowers/
+docs/superpowers/
+CodexSwitcherMac/docs/superpowers/
+
+# Dependencies
+node_modules/
+CodexSwitcherMac/node_modules/
+
+# Frontend / Tauri build outputs
+dist/
+dist-ssr/
+CodexSwitcherMac/dist/
+CodexSwitcherMac/dist-ssr/
+CodexSwitcherMac/src-tauri/target/
+CodexSwitcherMac/src-tauri/gen/schemas/
+CodexSwitcherMac/rollback-builds/
+
+# Logs and local env
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.local
+.env
+.env.*
+
+# Local databases, credentials, and distributable artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.dmg
+*.app
+*.pem
+*.p12
+auth.json
+config.toml

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CodexSwitcher 原型</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">CS</div>
+          <div>
+            <h1>CodexSwitcher</h1>
+            <p>账号调度与接力工作台</p>
+          </div>
+        </div>
+        <nav class="topnav">
+          <button class="nav-pill active">仪表盘</button>
+          <button class="nav-pill">账号中心</button>
+          <button class="nav-pill">接力中心</button>
+          <button class="nav-pill">通知中心</button>
+          <button class="nav-pill">设置</button>
+        </nav>
+      </header>
+
+      <main class="page">
+        <section class="hero-grid">
+          <article class="card hero-card">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">当前活跃账号</p>
+                <h2>账号 A</h2>
+              </div>
+              <span class="status-tag healthy">健康</span>
+            </div>
+
+            <div class="metric-row">
+              <div class="metric">
+                <span class="metric-label">当前窗口使用</span>
+                <strong>62%</strong>
+              </div>
+              <div class="metric">
+                <span class="metric-label">预计恢复</span>
+                <strong>1h 18m</strong>
+              </div>
+              <div class="metric">
+                <span class="metric-label">可信度</span>
+                <strong>估算</strong>
+              </div>
+            </div>
+
+            <div class="progress">
+              <div class="progress-bar" style="width: 62%"></div>
+            </div>
+
+            <div class="action-row">
+              <button class="btn btn-primary">查看官方扩容方案</button>
+              <button class="btn btn-secondary">生成接力</button>
+              <button class="btn btn-secondary">切换账号</button>
+            </div>
+          </article>
+
+          <article class="card recommendation-card">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">推荐动作</p>
+                <h2>下一步建议</h2>
+              </div>
+            </div>
+            <ol class="recommendation-list">
+              <li>优先查看官方扩容方案，当前账号已接近高频使用区间。</li>
+              <li>推荐切换到账号 B，剩余额度更健康，恢复时间更晚。</li>
+              <li>建议先生成接力卡片，再执行账号切换。</li>
+            </ol>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <article class="card">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">多账号状态</p>
+                <h2>账号总览</h2>
+              </div>
+              <button class="btn btn-ghost">查看全部</button>
+            </div>
+            <div id="account-list" class="account-list"></div>
+          </article>
+
+          <article class="card chart-card">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">用量历史图表</p>
+                <h2>使用趋势</h2>
+              </div>
+              <div class="toolbar">
+                <div class="segmented" data-segment="chart-range">
+                  <button class="active">24h</button>
+                  <button>3d</button>
+                  <button>7d</button>
+                </div>
+                <div class="segmented" data-segment="chart-mode">
+                  <button class="active">5h</button>
+                  <button>7d</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="chart-legend">
+              <span><i class="dot green"></i> 账号 A</span>
+              <span><i class="dot blue"></i> 账号 B</span>
+              <span><i class="dot neutral"></i> 账号 C</span>
+            </div>
+
+            <div id="usage-chart" class="chart-surface"></div>
+            <p class="helper-text">过去 7 天，账号 A 在 14:00 - 18:00 最容易进入预警。</p>
+          </article>
+
+          <article class="card timeline-card">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">账号时间轴</p>
+                <h2>未来预测</h2>
+              </div>
+              <div class="toolbar">
+                <div class="segmented" data-segment="timeline-range">
+                  <button>3h</button>
+                  <button class="active">6h</button>
+                  <button>12h</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="timeline-summary">
+              <span class="pill info">推荐路径：A → B → A</span>
+              <span class="pill success">预计连续使用 4h 40m</span>
+            </div>
+
+            <div id="timeline-lanes" class="timeline-lanes"></div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
