@@ -13,5 +13,8 @@
 
 - 官方账号导入的本地主线程写回 Codex 时，`model_provider` 统一写为 `openai`，避免从第三方 Key 导入到官方账号后仍被 Codex 官方账号视图过滤。
 - 官方账号写回时同步更新 rollout 首行 `session_meta.payload.model_provider`，避免 Codex 重建索引后又把已导入会话恢复成 `custom`。
+- Key 导入的本地主线程写回 Codex 时，`model_provider` 统一写为 `custom`，避免从官方账号导入到当前 Key 后仍被 Codex Key 视图过滤。
+- Key 写回时同步更新 rollout 首行 `session_meta.payload.model_provider`，避免 Codex 重建索引后又把已导入会话恢复成 `openai`。
+- 项目记录库读取时会轻量修正既有导入记录：若记录已归属 Key，但 Codex `threads` 仍是 `openai`，会回填为 `custom` 并解除归档；若记录归属官方账号，则回填为 `openai`。
 - 候选池和项目记录库只按 Codex 主线程口径展示 `source = vscode` 的记录，过滤子任务、审批审核线程等内部记录，避免 CodexSwitcher 会话数明显大于 Codex 侧边栏。
 - 已对本机既有官方账号导入记录做一次回填：只更新 `source = vscode` 且 `model_provider = custom` 的官方账号导入线程。

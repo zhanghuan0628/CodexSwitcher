@@ -2869,6 +2869,7 @@ fn map_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord
 fn query_session_records(connection: &Connection) -> Result<Vec<SessionRecord>, String> {
     backfill_codex_imported_session_titles(connection)?;
     backfill_codex_imported_session_owners(connection)?;
+    backfill_codex_imported_state_model_providers(connection)?;
     let mut stmt = connection
         .prepare(
             "SELECT s.id, s.project_id, p.name, p.workspace_path, s.owner_account_id,
@@ -3422,10 +3423,16 @@ fn codex_writeback_model_provider(
     session: &ParsedCodexLocalSession,
     owner: &SessionOwner,
 ) -> String {
-    if owner.profile_kind == "official_account" {
-        "openai".to_string()
-    } else {
-        session.model_provider.clone()
+    codex_model_provider_for_owner(&owner.profile_kind)
+        .map(str::to_string)
+        .unwrap_or_else(|| session.model_provider.clone())
+}
+
+fn codex_model_provider_for_owner(profile_kind: &str) -> Option<&'static str> {
+    match profile_kind {
+        "official_account" => Some("openai"),
+        "third_party_key" => Some("custom"),
+        _ => None,
     }
 }
 
@@ -4074,6 +4081,101 @@ fn backfill_codex_imported_session_owners(connection: &Connection) -> Result<(),
     }
 
     Ok(())
+}
+
+fn backfill_codex_imported_state_model_providers_for_dir(
+    connection: &Connection,
+    codex_dir: &Path,
+) -> Result<(), String> {
+    let state_path = codex_dir.join("state_5.sqlite");
+    if !state_path.exists() {
+        return Ok(());
+    }
+
+    let candidates = {
+        let mut stmt = connection
+            .prepare(
+                "SELECT owner_profile_kind, external_session_id
+                 FROM session_records
+                 WHERE record_type = 'codex_imported'
+                   AND owner_profile_kind IN ('official_account', 'third_party_key')
+                   AND external_session_id IS NOT NULL
+                   AND TRIM(external_session_id) != ''
+                 LIMIT 300",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let state = match Connection::open(&state_path) {
+        Ok(state) => state,
+        Err(_) => return Ok(()),
+    };
+
+    for (profile_kind, external_session_id) in candidates {
+        let Some(expected_provider) = codex_model_provider_for_owner(&profile_kind) else {
+            continue;
+        };
+        let thread = state
+            .query_row(
+                "SELECT model_provider, source, archived, rollout_path
+                 FROM threads
+                 WHERE id = ?1",
+                [external_session_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional();
+        let Ok(Some((model_provider, source, archived, rollout_path))) = thread else {
+            continue;
+        };
+        if !is_main_codex_thread_source(&source) {
+            continue;
+        }
+        if model_provider == expected_provider && archived == 0 {
+            continue;
+        }
+
+        if let Err(_) = state.execute(
+            "UPDATE threads
+             SET model_provider = ?1, archived = 0, archived_at = NULL
+             WHERE id = ?2 AND source = 'vscode'",
+            params![expected_provider, external_session_id],
+        ) {
+            continue;
+        }
+
+        let rollout_path = Path::new(&rollout_path);
+        if rollout_path.exists() {
+            let _ = sync_rollout_session_meta_model_provider(rollout_path, expected_provider);
+        }
+    }
+
+    Ok(())
+}
+
+fn backfill_codex_imported_state_model_providers(connection: &Connection) -> Result<(), String> {
+    let Ok(codex_dir) = codex_config_dir() else {
+        return Ok(());
+    };
+    backfill_codex_imported_state_model_providers_for_dir(connection, &codex_dir)
 }
 
 fn import_codex_local_sessions_from_dir(
@@ -6731,6 +6833,8 @@ fn list_sessions_for_profile(
         .lock()
         .map_err(|_| "数据库锁获取失败".to_string())?;
     backfill_codex_imported_session_titles(&connection)?;
+    backfill_codex_imported_session_owners(&connection)?;
+    backfill_codex_imported_state_model_providers(&connection)?;
     let mut stmt = connection
         .prepare(
             "SELECT DISTINCT s.id, s.project_id, p.name, p.workspace_path, s.owner_account_id,
@@ -9061,6 +9165,193 @@ mod tests {
                 .and_then(|payload| payload.get("model_provider"))
                 .and_then(Value::as_str),
             Some("openai")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn importing_official_thread_into_active_key_writes_custom_provider() {
+        let connection = setup_test_connection();
+        let key_profile = create_key_profile_record(
+            &connection,
+            CreateKeyProfileInput {
+                provider: "oneTop".to_string(),
+                nickname: "oneTop".to_string(),
+                base_url: "https://www.onetopai.asia".to_string(),
+                model: "gpt-5-codex".to_string(),
+                api_key: "example-api-key-abcdef1234567890".to_string(),
+            },
+            "keychain://official-to-key-writeback-test",
+        )
+        .expect("create key profile");
+        activate_credential_profile_record(&connection, key_profile.id).expect("activate key");
+
+        let root = std::env::temp_dir().join(format!(
+            "codexswitcher-official-to-key-test-{}-{}",
+            std::process::id(),
+            now_text().replace([' ', ':'], "-")
+        ));
+        let rollout_path = root.join("sessions/rollout-official-to-key.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+            .expect("create sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-04-26T04:00:00Z","type":"session_meta","payload":{"id":"official-to-key-thread","timestamp":"2026-04-26T04:00:00Z","cwd":"/Users/admin/IdeaProjects/Visora","model_provider":"openai"}}
+{"timestamp":"2026-04-26T04:00:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"官方账号线程导入到 Key"}]}}
+"#,
+        )
+        .expect("write rollout");
+        let state = create_codex_state_db(&root);
+        state
+            .execute(
+                "INSERT INTO threads
+                    (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                     sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
+                     cli_version, first_user_message, memory_mode)
+                 VALUES
+                    ('official-to-key-thread', ?1, 1777176000, 1777176060, 'vscode', 'openai',
+                     '/Users/admin/IdeaProjects/Visora', '官方账号线程',
+                     'workspace-write', 'on-request', 0, 1, 0, 'test', '', 'enabled')",
+                [rollout_path.to_string_lossy().to_string()],
+            )
+            .expect("insert state thread");
+        drop(state);
+
+        let result = import_codex_local_session_candidates_from_dir(
+            &connection,
+            &root,
+            &["official-to-key-thread".to_string()],
+            true,
+        )
+        .expect("import selected candidate");
+
+        assert_eq!(result.imported_sessions, 1);
+        assert_eq!(result.codex_synced_threads, 1);
+
+        let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
+        let model_provider: String = state
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'official-to-key-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query model provider");
+        assert_eq!(model_provider, "custom");
+
+        let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
+        let first_line = rollout_content.lines().next().expect("rollout meta line");
+        let meta: Value = serde_json::from_str(first_line).expect("parse rollout meta");
+        assert_eq!(
+            meta.get("payload")
+                .and_then(|payload| payload.get("model_provider"))
+                .and_then(Value::as_str),
+            Some("custom")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn listing_records_repairs_existing_key_import_thread_provider() {
+        let connection = setup_test_connection();
+        let key_profile = create_key_profile_record(
+            &connection,
+            CreateKeyProfileInput {
+                provider: "oneTop".to_string(),
+                nickname: "oneTop".to_string(),
+                base_url: "https://www.onetopai.asia".to_string(),
+                model: "gpt-5-codex".to_string(),
+                api_key: "example-api-key-abcdef1234567890".to_string(),
+            },
+            "keychain://existing-key-writeback-test",
+        )
+        .expect("create key profile");
+
+        let root = std::env::temp_dir().join(format!(
+            "codexswitcher-existing-key-repair-test-{}-{}",
+            std::process::id(),
+            now_text().replace([' ', ':'], "-")
+        ));
+        let rollout_path = root.join("sessions/rollout-existing-key.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+            .expect("create sessions dir");
+        fs::write(
+            &rollout_path,
+            r#"{"timestamp":"2026-04-26T04:00:00Z","type":"session_meta","payload":{"id":"existing-key-thread","timestamp":"2026-04-26T04:00:00Z","cwd":"/Users/admin/IdeaProjects/Visora","model_provider":"openai"}}
+{"timestamp":"2026-04-26T04:00:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"已有 Key 导入记录"}]}}
+"#,
+        )
+        .expect("write rollout");
+        let state = create_codex_state_db(&root);
+        state
+            .execute(
+                "INSERT INTO threads
+                    (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                     sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
+                     cli_version, first_user_message, memory_mode)
+                 VALUES
+                    ('existing-key-thread', ?1, 1777176000, 1777176060, 'vscode', 'openai',
+                     '/Users/admin/IdeaProjects/Visora', '已有 Key 导入记录',
+                     'workspace-write', 'on-request', 0, 1, 0, 'test', '', 'enabled')",
+                [rollout_path.to_string_lossy().to_string()],
+            )
+            .expect("insert state thread");
+        drop(state);
+
+        let now = now_text();
+        connection
+            .execute(
+                "INSERT INTO local_projects (name, workspace_path, git_remote, last_active_at, created_at, updated_at)
+                 VALUES ('Visora', '/Users/admin/IdeaProjects/Visora', NULL, ?1, ?1, ?1)",
+                [&now],
+            )
+            .expect("insert local project");
+        let project_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO session_records
+                    (project_id, owner_account_id, owner_profile_kind, owner_profile_ref,
+                     record_type, title, summary, raw_content, message_count,
+                     source_record_id, external_session_id, created_at, updated_at)
+                 VALUES (?1, NULL, 'third_party_key', ?2, 'codex_imported',
+                         '已有 Key 导入记录', 'summary', ?3, 1, NULL, 'existing-key-thread', ?4, ?4)",
+                params![
+                    project_id,
+                    format!("key:{}", key_profile.id),
+                    json!({
+                        "source": "codex_local_session",
+                        "session_id": "existing-key-thread",
+                        "source_path": rollout_path.to_string_lossy().to_string(),
+                        "workspace_path": "/Users/admin/IdeaProjects/Visora",
+                    })
+                    .to_string(),
+                    now
+                ],
+            )
+            .expect("insert imported record");
+
+        backfill_codex_imported_state_model_providers_for_dir(&connection, &root)
+            .expect("repair existing key import");
+
+        let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
+        let model_provider: String = state
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'existing-key-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query model provider");
+        assert_eq!(model_provider, "custom");
+
+        let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
+        let first_line = rollout_content.lines().next().expect("rollout meta line");
+        let meta: Value = serde_json::from_str(first_line).expect("parse rollout meta");
+        assert_eq!(
+            meta.get("payload")
+                .and_then(|payload| payload.get("model_provider"))
+                .and_then(Value::as_str),
+            Some("custom")
         );
 
         let _ = fs::remove_dir_all(root);
