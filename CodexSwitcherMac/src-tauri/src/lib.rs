@@ -585,6 +585,7 @@ fn mark_account_auth_invalid(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_real_usage_read_error(
     connection: &Connection,
     account: &Account,
@@ -1598,6 +1599,7 @@ fn apply_background_sampling_outcome(
     now: chrono::DateTime<Local>,
     outcome: RealAccountSamplingOutcome,
     created_notifications: &mut i32,
+    notification_limit: i32,
 ) -> Result<(), String> {
     let now_text = now.format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -1612,7 +1614,7 @@ fn apply_background_sampling_outcome(
                     params![now_text, account.id],
                 )
                 .map_err(|error| error.to_string())?;
-            if *created_notifications < 3 {
+            if *created_notifications < notification_limit {
                 insert_account_notification(
                     connection,
                     account.id,
@@ -1633,7 +1635,7 @@ fn apply_background_sampling_outcome(
                     params![now_text, account.id],
                 )
                 .map_err(|error| error.to_string())?;
-            if *created_notifications < 3 {
+            if *created_notifications < notification_limit {
                 insert_account_notification(
                     connection,
                     account.id,
@@ -1655,6 +1657,8 @@ fn apply_background_sampling_outcome(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn sample_real_account_usage(
     connection: &Connection,
     account: &Account,
@@ -1751,6 +1755,7 @@ fn sample_real_account_usage(
     Ok(false)
 }
 
+#[cfg(test)]
 fn run_resilient_sampling_cycle<F>(accounts: &[Account], mut sampler: F) -> Vec<String>
 where
     F: FnMut(&Account) -> Result<bool, String>,
@@ -5593,6 +5598,8 @@ fn build_recommendations(
     Ok((recommendations, recommended_account_id, recommended_reason))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn sample_accounts_with_notifications(
     connection: &Connection,
     accounts: &[Account],
@@ -5642,6 +5649,8 @@ fn sample_accounts_with_notifications(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn generate_usage_snapshots(connection: &Connection) -> Result<(), String> {
     let accounts = query_accounts(connection)?
         .into_iter()
@@ -5650,6 +5659,8 @@ fn generate_usage_snapshots(connection: &Connection) -> Result<(), String> {
     sample_accounts_with_notifications(connection, &accounts, 3)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn generate_active_usage_snapshot(connection: &Connection) -> Result<(), String> {
     let accounts = query_accounts(connection)?;
     let target_accounts = accounts
@@ -5676,6 +5687,92 @@ fn generate_active_usage_snapshot(connection: &Connection) -> Result<(), String>
     }
 
     sample_accounts_with_notifications(connection, &target_accounts, 1)
+}
+
+fn active_sampling_accounts(accounts: &[Account]) -> Vec<Account> {
+    accounts
+        .iter()
+        .find(|account| account.is_active && account.is_real_session)
+        .cloned()
+        .or_else(|| {
+            accounts
+                .iter()
+                .find(|account| account.is_default && account.is_real_session)
+                .cloned()
+        })
+        .or_else(|| {
+            accounts
+                .iter()
+                .find(|account| account.is_real_session)
+                .cloned()
+        })
+        .into_iter()
+        .collect()
+}
+
+fn sample_accounts_without_long_db_lock(
+    state: &AppState,
+    accounts: &[Account],
+    notification_limit: i32,
+) -> Result<(), String> {
+    let mut created_notifications = 0;
+    let mut failures = Vec::new();
+
+    for account in accounts {
+        let outcome = collect_real_account_sampling_outcome(account);
+        let now = Local::now();
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| "数据库锁获取失败".to_string())?;
+
+        match outcome {
+            Ok(outcome) => {
+                apply_background_sampling_outcome(
+                    &connection,
+                    account,
+                    now,
+                    outcome,
+                    &mut created_notifications,
+                    notification_limit,
+                )?;
+            }
+            Err(error) => failures.push(format!("{}：{}", account.nickname, error)),
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(summarize_sampling_failures(&failures));
+    }
+
+    Ok(())
+}
+
+fn generate_usage_snapshots_for_state(state: &AppState) -> Result<(), String> {
+    let accounts = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| "数据库锁获取失败".to_string())?;
+        query_accounts(&connection)?
+            .into_iter()
+            .filter(|account| account.is_real_session)
+            .collect::<Vec<_>>()
+    };
+
+    sample_accounts_without_long_db_lock(state, &accounts, 3)
+}
+
+fn generate_active_usage_snapshot_for_state(state: &AppState) -> Result<(), String> {
+    let target_accounts = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| "数据库锁获取失败".to_string())?;
+        active_sampling_accounts(&query_accounts(&connection)?)
+    };
+
+    sample_accounts_without_long_db_lock(state, &target_accounts, 1)
 }
 
 fn dashboard_overview(connection: &Connection) -> Result<DashboardOverview, String> {
@@ -6497,11 +6594,16 @@ fn trigger_usage_sampling(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<DashboardOverview, String> {
+    let Some(_guard) = try_begin_sampling_run(&state) else {
+        return Err("已有采样任务正在运行，请稍后刷新状态。".to_string());
+    };
+
+    generate_active_usage_snapshot_for_state(&state)?;
+
     let connection = state
         .db
         .lock()
         .map_err(|_| "数据库锁获取失败".to_string())?;
-    generate_active_usage_snapshot(&connection)?;
     maybe_enqueue_recovery_notifications(&connection)?;
     let overview = dashboard_overview(&connection)?;
     let presentation = current_tray_presentation(&connection);
@@ -6548,6 +6650,7 @@ fn enqueue_post_switch_sampling(app_handle: &tauri::AppHandle, target_account_id
                     now,
                     outcome,
                     &mut created_notifications,
+                    3,
                 )
                 .is_ok()
                 {
@@ -7233,6 +7336,7 @@ fn run_background_sampling_pass(
                     now,
                     outcome,
                     &mut created_notifications,
+                    3,
                 )?;
             }
             Err(error) => failures.push(format!("{}：{}", account.nickname, error)),
@@ -7617,9 +7721,11 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
             }
             "sample" => {
                 if let Some(state) = app.try_state::<AppState>() {
-                    if let Ok(connection) = state.db.lock() {
-                        let _ = generate_usage_snapshots(&connection);
-                        let _ = maybe_enqueue_recovery_notifications(&connection);
+                    if let Some(_guard) = try_begin_sampling_run(&state) {
+                        let _ = generate_usage_snapshots_for_state(&state);
+                        if let Ok(connection) = state.db.lock() {
+                            let _ = maybe_enqueue_recovery_notifications(&connection);
+                        }
                     }
                 }
                 if let Some(state) = app.try_state::<AppState>() {

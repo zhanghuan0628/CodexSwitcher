@@ -2,10 +2,14 @@ use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
+const CODEX_COMMAND_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct CodexAuthStatus {
@@ -74,6 +78,28 @@ fn command_with_gui_env(program: &Path) -> Command {
     command
 }
 
+fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let started_at = Instant::now();
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("命令执行超过 {} 秒", timeout.as_secs()),
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn codex_cli_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -94,10 +120,12 @@ fn codex_cli_candidates() -> Vec<PathBuf> {
 }
 
 fn resolve_command_to_absolute_path(command_name: &str) -> Option<PathBuf> {
-    let output = command_with_gui_env(Path::new("/bin/zsh"))
-        .args(["-lc", &format!("command -v {}", command_name)])
-        .output()
-        .ok()?;
+    let output = command_output_with_timeout(
+        command_with_gui_env(Path::new("/bin/zsh"))
+            .args(["-lc", &format!("command -v {}", command_name)]),
+        Duration::from_secs(CODEX_COMMAND_TIMEOUT_SECS),
+    )
+    .ok()?;
 
     if !output.status.success() {
         return None;
@@ -115,7 +143,10 @@ pub(crate) fn resolve_codex_cli_path() -> Result<PathBuf, String> {
     let mut last_error = String::new();
 
     for candidate in codex_cli_candidates() {
-        match command_with_gui_env(&candidate).arg("--help").output() {
+        match command_output_with_timeout(
+            command_with_gui_env(&candidate).arg("--help"),
+            Duration::from_secs(CODEX_COMMAND_TIMEOUT_SECS),
+        ) {
             Ok(output) if output.status.success() => {
                 if candidate.is_absolute() {
                     return Ok(candidate);
@@ -252,10 +283,10 @@ pub(crate) fn read_codex_auth_status() -> Result<CodexAuthStatus, String> {
     let mut output = None;
 
     for candidate in codex_cli_candidates() {
-        match command_with_gui_env(&candidate)
-            .args(["login", "status"])
-            .output()
-        {
+        match command_output_with_timeout(
+            command_with_gui_env(&candidate).args(["login", "status"]),
+            Duration::from_secs(CODEX_COMMAND_TIMEOUT_SECS),
+        ) {
             Ok(result)
                 if String::from_utf8_lossy(&result.stdout)
                     .to_ascii_lowercase()
@@ -327,10 +358,10 @@ pub(crate) fn diagnose_bind_environment() -> Result<BindEnvironmentDiagnostic, S
     let mut cli_stderr = String::new();
 
     for candidate in &cli_candidates {
-        match command_with_gui_env(candidate)
-            .args(["login", "status"])
-            .output()
-        {
+        match command_output_with_timeout(
+            command_with_gui_env(candidate).args(["login", "status"]),
+            Duration::from_secs(CODEX_COMMAND_TIMEOUT_SECS),
+        ) {
             Ok(output) => {
                 cli_available = Some(candidate.display().to_string());
                 cli_status_ok = output.status.success();
@@ -373,15 +404,16 @@ pub(crate) fn start_codex_login_flow() -> Result<String, String> {
         escape_applescript_string(&login_command)
     );
 
-    let output = Command::new("osascript")
-        .args([
+    let output = command_output_with_timeout(
+        Command::new("osascript").args([
             "-e",
             &script,
             "-e",
             "tell application \"Terminal\" to activate",
-        ])
-        .output()
-        .map_err(|error| format!("打开官方登录流程失败：{}", error))?;
+        ]),
+        Duration::from_secs(CODEX_COMMAND_TIMEOUT_SECS),
+    )
+    .map_err(|error| format!("打开官方登录流程失败：{}", error))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
