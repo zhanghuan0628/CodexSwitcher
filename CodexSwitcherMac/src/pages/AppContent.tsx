@@ -240,7 +240,7 @@ export function AppContent({
       label: "刷新状态",
       tone: "primary" as const,
       disabled: loading || submitting,
-      onClick: () => void onLoadBootstrap(),
+      onClick: () => void onRefreshOverview(),
     },
     sample: {
       key: "sample",

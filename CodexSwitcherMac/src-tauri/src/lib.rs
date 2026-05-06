@@ -54,7 +54,7 @@ use usage::{
 
 const TRAY_ID: &str = "codexswitcher-menu";
 const RECOVERY_REMINDER_MINUTES: i64 = 15;
-const DEFAULT_CHECK_INTERVAL_SECS: i64 = 15;
+const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
 
 struct AppState {
     db: Mutex<Connection>,
@@ -1506,14 +1506,14 @@ fn seed_defaults(connection: &Connection) -> Result<(), String> {
 
     connection
         .execute(
-            "UPDATE app_settings SET check_interval = ?1 WHERE id = 1 AND check_interval = 120",
+            "UPDATE app_settings SET check_interval = ?1 WHERE id = 1 AND check_interval IN (15, 120)",
             [DEFAULT_CHECK_INTERVAL_SECS],
         )
         .map_err(|error| error.to_string())?;
 
     connection
         .execute(
-            "UPDATE app_settings SET check_interval = ?1 WHERE id = 1 AND check_interval > 30",
+            "UPDATE app_settings SET check_interval = ?1 WHERE id = 1 AND check_interval < 10",
             [DEFAULT_CHECK_INTERVAL_SECS],
         )
         .map_err(|error| error.to_string())?;
@@ -1540,7 +1540,10 @@ enum RealAccountSamplingOutcome {
 fn collect_real_account_sampling_outcome(
     account: &Account,
 ) -> Result<RealAccountSamplingOutcome, String> {
-    let verified = verify_real_codex_session()?;
+    let verified = match verify_real_codex_session() {
+        Ok(verified) => verified,
+        Err(_) => return collect_bound_snapshot_sampling_outcome(account),
+    };
     let live_snapshot = live_session_snapshot(&verified)?;
     let same_session = match account_matches_live_session(account, &verified, &live_snapshot) {
         Ok(value) => value,
@@ -1575,6 +1578,28 @@ fn collect_real_account_sampling_outcome(
             return Ok(RealAccountSamplingOutcome::Expired);
         }
     };
+
+    if !bound_snapshot_matches_account(account, &bound_snapshot) {
+        return Ok(RealAccountSamplingOutcome::Mismatch);
+    }
+
+    match read_real_usage_from_live_session(account, &bound_snapshot) {
+        Ok(Some(reading)) => Ok(RealAccountSamplingOutcome::Updated(reading)),
+        Ok(None) => Ok(RealAccountSamplingOutcome::Unavailable),
+        Err(error) => {
+            if error.kind == RealUsageReadErrorKind::AuthInvalid {
+                Ok(RealAccountSamplingOutcome::Expired)
+            } else {
+                Err(error.message)
+            }
+        }
+    }
+}
+
+fn collect_bound_snapshot_sampling_outcome(
+    account: &Account,
+) -> Result<RealAccountSamplingOutcome, String> {
+    let bound_snapshot = read_bound_session_snapshot(account)?;
 
     if !bound_snapshot_matches_account(account, &bound_snapshot) {
         return Ok(RealAccountSamplingOutcome::Mismatch);
@@ -5689,6 +5714,7 @@ fn generate_active_usage_snapshot(connection: &Connection) -> Result<(), String>
     sample_accounts_with_notifications(connection, &target_accounts, 1)
 }
 
+#[cfg(test)]
 fn active_sampling_accounts(accounts: &[Account]) -> Vec<Account> {
     accounts
         .iter()
@@ -5763,6 +5789,8 @@ fn generate_usage_snapshots_for_state(state: &AppState) -> Result<(), String> {
     sample_accounts_without_long_db_lock(state, &accounts, 3)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn generate_active_usage_snapshot_for_state(state: &AppState) -> Result<(), String> {
     let target_accounts = {
         let connection = state
@@ -6598,7 +6626,7 @@ fn trigger_usage_sampling(
         return Err("已有采样任务正在运行，请稍后刷新状态。".to_string());
     };
 
-    generate_active_usage_snapshot_for_state(&state)?;
+    generate_usage_snapshots_for_state(&state)?;
 
     let connection = state
         .db

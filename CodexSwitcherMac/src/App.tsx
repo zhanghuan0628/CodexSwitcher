@@ -66,7 +66,7 @@ const emptySettings: AppSettings = {
   warn_threshold_low: 70,
   warn_threshold_mid: 85,
   warn_threshold_high: 95,
-  check_interval: 15,
+  check_interval: 60,
   enable_handoff: true,
   prefer_official_upgrade: true,
   enable_auto_refresh: true,
@@ -169,7 +169,6 @@ function App() {
         includeSelectedAccountDetail: false,
         ignoreCooldown: false,
       });
-      await refreshCredentialProfiles();
     })();
   });
 
@@ -738,6 +737,10 @@ function App() {
     }
   }
 
+  async function refreshStatusNow() {
+    await sampleNow();
+  }
+
   async function importCodexLocalSessions(candidateIds?: string[]) {
     setImportingCodexSessions(true);
     setLastOperationError(null);
@@ -1165,7 +1168,7 @@ function App() {
           onMakeDefault={makeDefault}
           onNavigate={navigateTo}
           onOpenAccountDetail={openAccountDetail}
-          onRefreshOverview={refreshOverview}
+          onRefreshOverview={refreshStatusNow}
           onRemoveAccount={removeAccount}
           onRepairAuth={repairAuth}
           onSampleNow={sampleNow}
