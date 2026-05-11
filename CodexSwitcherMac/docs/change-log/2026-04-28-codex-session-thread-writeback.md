@@ -18,3 +18,11 @@
 - 项目记录库读取时会轻量修正既有导入记录：若记录已归属 Key，但 Codex `threads` 仍是 `openai`，会回填为 `custom` 并解除归档；若记录归属官方账号，则回填为 `openai`。
 - 候选池和项目记录库只按 Codex 主线程口径展示 `source = vscode` 的记录，过滤子任务、审批审核线程等内部记录，避免 CodexSwitcher 会话数明显大于 Codex 侧边栏。
 - 已对本机既有官方账号导入记录做一次回填：只更新 `source = vscode` 且 `model_provider = custom` 的官方账号导入线程。
+
+## 2026-05-11 补充
+
+- 第三方 Key 写回 Codex 线程索引时，不再固定使用 `custom` 作为 `model_provider`。
+- 优先读取当前 Codex `config.toml` 顶层 `model_provider`；读取不到时使用 CodexSwitcher 中当前 Key 的供应商字段，最后才兼容兜底为 `custom`。
+- 第三方 Key 运行配置生成时，`model_provider` 和 `[model_providers]` 表名改为使用 Key 的供应商字段，支持用户改名或不同安装环境使用非 `custom` 名称。
+- 候选会话归类不再只把 `custom` 识别为 Key，会把非 `openai` 的 `model_provider` 作为第三方 Key 来源展示。
+- 验证方式：`cargo test`。

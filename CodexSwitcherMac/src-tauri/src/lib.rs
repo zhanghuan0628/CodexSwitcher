@@ -2183,6 +2183,89 @@ fn escape_toml_basic_string(value: &str) -> String {
         .replace('\r', "\\r")
 }
 
+fn parse_toml_inline_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = value.strip_prefix('"') {
+        let mut escaped = false;
+        let mut parsed = String::new();
+        for character in rest.chars() {
+            if escaped {
+                match character {
+                    '"' => parsed.push('"'),
+                    '\\' => parsed.push('\\'),
+                    'n' => parsed.push('\n'),
+                    'r' => parsed.push('\r'),
+                    't' => parsed.push('\t'),
+                    other => parsed.push(other),
+                }
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '"' => return Some(parsed.trim().to_string()).filter(|item| !item.is_empty()),
+                other => parsed.push(other),
+            }
+        }
+        return None;
+    }
+
+    if let Some(rest) = value.strip_prefix('\'') {
+        let parsed = rest.split('\'').next()?.trim().to_string();
+        return Some(parsed).filter(|item| !item.is_empty());
+    }
+
+    let parsed = value
+        .split('#')
+        .next()
+        .unwrap_or(value)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Some(parsed).filter(|item| !item.is_empty())
+}
+
+fn read_codex_config_model_provider_from_dir(config_dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(config_dir.join("config.toml")).ok()?;
+    let mut in_root_table = true;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_root_table = false;
+            continue;
+        }
+        if !in_root_table {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "model_provider" {
+            continue;
+        }
+        return parse_toml_inline_string(value);
+    }
+    None
+}
+
+fn key_profile_model_provider(profile: &CredentialProfile) -> String {
+    let provider = profile.provider.trim();
+    if provider.is_empty() {
+        "custom".to_string()
+    } else {
+        provider.to_string()
+    }
+}
+
 fn normalize_openai_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.ends_with("/v1") || trimmed.contains("/v1/") {
@@ -2567,13 +2650,17 @@ fn write_key_profile_runtime_files(
     fs::create_dir_all(config_dir)
         .map_err(|error| format!("创建 Codex 配置目录失败：{}", error))?;
 
+    let model_provider = key_profile_model_provider(profile);
     let auth_json = format!(
         "{{\"OPENAI_API_KEY\":\"{}\"}}\n",
         escape_json_string(api_key)
     );
     let config_toml = format!(
-        "model_provider = \"custom\"\nmodel = \"{}\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
+        "model_provider = \"{}\"\nmodel = \"{}\"\ndisable_response_storage = true\n\n[model_providers.\"{}\"]\nname = \"{}\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
+        escape_toml_basic_string(&model_provider),
         escape_toml_basic_string(model),
+        escape_toml_basic_string(&model_provider),
+        escape_toml_basic_string(&model_provider),
         escape_toml_basic_string(&base_url),
     );
 
@@ -3450,18 +3537,51 @@ fn is_main_codex_session_record(
 }
 
 fn codex_writeback_model_provider(
+    connection: &Connection,
+    codex_dir: &Path,
     session: &ParsedCodexLocalSession,
     owner: &SessionOwner,
 ) -> String {
-    codex_model_provider_for_owner(&owner.profile_kind)
-        .map(str::to_string)
+    codex_model_provider_for_owner(connection, codex_dir, owner, true)
         .unwrap_or_else(|| session.model_provider.clone())
 }
 
-fn codex_model_provider_for_owner(profile_kind: &str) -> Option<&'static str> {
-    match profile_kind {
-        "official_account" => Some("openai"),
-        "third_party_key" => Some("custom"),
+fn key_profile_model_provider_from_ref(
+    connection: &Connection,
+    profile_ref: &str,
+) -> Option<String> {
+    let profile_id = profile_ref
+        .strip_prefix("key:")
+        .unwrap_or(profile_ref)
+        .parse::<i64>()
+        .ok()?;
+    query_credential_profile_by_id(connection, profile_id)
+        .ok()
+        .map(|profile| key_profile_model_provider(&profile))
+}
+
+fn codex_model_provider_for_owner(
+    connection: &Connection,
+    codex_dir: &Path,
+    owner: &SessionOwner,
+    prefer_runtime_config: bool,
+) -> Option<String> {
+    match owner.profile_kind.as_str() {
+        "official_account" => Some("openai".to_string()),
+        "third_party_key" => {
+            let runtime_provider = || read_codex_config_model_provider_from_dir(codex_dir);
+            let profile_provider =
+                || key_profile_model_provider_from_ref(connection, &owner.profile_ref);
+            if prefer_runtime_config {
+                runtime_provider()
+                    .or_else(profile_provider)
+                    .or_else(|| Some("custom".to_string()))
+            } else {
+                profile_provider()
+                    .or_else(runtime_provider)
+                    .or_else(|| Some("custom".to_string()))
+            }
+        }
         _ => None,
     }
 }
@@ -3558,6 +3678,7 @@ fn first_user_message_from_rollout(path: &Path) -> Option<String> {
 }
 
 fn upsert_codex_state_thread_for_session(
+    connection: &Connection,
     codex_dir: &Path,
     session: &ParsedCodexLocalSession,
     owner: &SessionOwner,
@@ -3580,7 +3701,7 @@ fn upsert_codex_state_thread_for_session(
     let updated_at_ms = updated_at * 1000;
     let sandbox_policy = codex_thread_sandbox_policy(&session.workspace_path);
     let first_user_message = first_user_message_from_rollout(rollout_path).unwrap_or_default();
-    let model_provider = codex_writeback_model_provider(session, owner);
+    let model_provider = codex_writeback_model_provider(connection, codex_dir, session, owner);
     sync_rollout_session_meta_model_provider(rollout_path, &model_provider)?;
     state
         .execute(
@@ -4125,7 +4246,7 @@ fn backfill_codex_imported_state_model_providers_for_dir(
     let candidates = {
         let mut stmt = connection
             .prepare(
-                "SELECT owner_profile_kind, external_session_id
+                "SELECT owner_profile_kind, owner_profile_ref, external_session_id
                  FROM session_records
                  WHERE record_type = 'codex_imported'
                    AND owner_profile_kind IN ('official_account', 'third_party_key')
@@ -4136,7 +4257,11 @@ fn backfill_codex_imported_state_model_providers_for_dir(
             .map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|error| error.to_string())?;
 
@@ -4153,8 +4278,15 @@ fn backfill_codex_imported_state_model_providers_for_dir(
         Err(_) => return Ok(()),
     };
 
-    for (profile_kind, external_session_id) in candidates {
-        let Some(expected_provider) = codex_model_provider_for_owner(&profile_kind) else {
+    for (profile_kind, profile_ref, external_session_id) in candidates {
+        let owner = SessionOwner {
+            account_id: None,
+            profile_kind,
+            profile_ref,
+        };
+        let Some(expected_provider) =
+            codex_model_provider_for_owner(connection, codex_dir, &owner, false)
+        else {
             continue;
         };
         let thread = state
@@ -4194,7 +4326,7 @@ fn backfill_codex_imported_state_model_providers_for_dir(
 
         let rollout_path = Path::new(&rollout_path);
         if rollout_path.exists() {
-            let _ = sync_rollout_session_meta_model_provider(rollout_path, expected_provider);
+            let _ = sync_rollout_session_meta_model_provider(rollout_path, &expected_provider);
         }
     }
 
@@ -4306,12 +4438,16 @@ fn active_official_candidate_identity(
     }))
 }
 
+fn is_official_codex_model_provider(model_provider: &str) -> bool {
+    model_provider.trim().eq_ignore_ascii_case("openai")
+}
+
 fn candidate_identity_for_session(
     connection: &Connection,
     session: &ParsedCodexLocalSession,
     imported: Option<&(i64, String, String)>,
 ) -> Result<CodexCandidateIdentity, String> {
-    if session.model_provider == "custom" {
+    if !is_official_codex_model_provider(&session.model_provider) {
         if let Some(identity) = infer_custom_candidate_identity_from_source(
             connection,
             Path::new(&session.source_path),
@@ -4326,23 +4462,31 @@ fn candidate_identity_for_session(
         }
     }
 
-    if session.model_provider == "custom" {
-    } else if let Some(identity) = active_official_candidate_identity(connection)? {
+    if is_official_codex_model_provider(&session.model_provider) {
+        if let Some(identity) = active_official_candidate_identity(connection)? {
+            return Ok(identity);
+        }
+    } else {
+        let label = if session.model_provider.trim().is_empty() {
+            "本地自定义 Key".to_string()
+        } else {
+            format!("本地 {}", session.model_provider.trim())
+        };
+        return Ok(CodexCandidateIdentity {
+            key: format!("codex_provider:{}", session.model_provider),
+            label,
+            kind_label: "Key".to_string(),
+        });
+    }
+
+    if let Some(identity) = active_official_candidate_identity(connection)? {
         return Ok(identity);
     }
 
     Ok(CodexCandidateIdentity {
         key: format!("codex_provider:{}", session.model_provider),
-        label: if session.model_provider == "custom" {
-            "本地自定义 Key".to_string()
-        } else {
-            "本地 OpenAI".to_string()
-        },
-        kind_label: if session.model_provider == "custom" {
-            "Key".to_string()
-        } else {
-            "官方账号".to_string()
-        },
+        label: "本地 OpenAI".to_string(),
+        kind_label: "官方账号".to_string(),
     })
 }
 
@@ -4443,7 +4587,7 @@ fn import_codex_local_session_candidates_from_dir(
             } else {
                 updated_sessions += 1;
             }
-            if upsert_codex_state_thread_for_session(codex_dir, &session, &owner)? {
+            if upsert_codex_state_thread_for_session(connection, codex_dir, &session, &owner)? {
                 codex_synced_threads += 1;
             } else {
                 codex_skipped_threads += 1;
@@ -4503,7 +4647,7 @@ fn import_codex_local_session_candidates_from_dir(
                 } else {
                     updated_sessions += 1;
                 }
-                if upsert_codex_state_thread_for_session(codex_dir, &session, &owner)? {
+                if upsert_codex_state_thread_for_session(connection, codex_dir, &session, &owner)? {
                     codex_synced_threads += 1;
                 } else {
                     codex_skipped_threads += 1;
@@ -8581,7 +8725,7 @@ mod tests {
     }
 
     #[test]
-    fn key_profile_runtime_files_write_auth_and_custom_provider_config() {
+    fn key_profile_runtime_files_write_auth_and_named_provider_config() {
         let config_dir = unique_temp_file("key-runtime-config");
         let _ = fs::remove_dir_all(&config_dir);
         fs::create_dir_all(&config_dir).expect("create config dir");
@@ -8589,7 +8733,7 @@ mod tests {
         let profile = CredentialProfile {
             id: 1,
             profile_kind: "third_party_key".to_string(),
-            provider: "custom".to_string(),
+            provider: "yuchat".to_string(),
             nickname: "YuChat".to_string(),
             status: "unknown".to_string(),
             is_active: true,
@@ -8613,7 +8757,9 @@ mod tests {
         let config_toml = fs::read_to_string(config_dir.join("config.toml")).expect("read config");
 
         assert!(auth_json.contains("\"OPENAI_API_KEY\":\"example-api-key-1234567890abcdef\""));
-        assert!(config_toml.contains("model_provider = \"custom\""));
+        assert!(config_toml.contains("model_provider = \"yuchat\""));
+        assert!(config_toml.contains("[model_providers.\"yuchat\"]"));
+        assert!(config_toml.contains("name = \"yuchat\""));
         assert!(config_toml.contains("model = \"gpt-5-codex\""));
         assert!(config_toml.contains("base_url = \"https://sub2api.yuchat.top/v1\""));
         assert!(config_toml.contains("requires_openai_auth = true"));
@@ -9305,7 +9451,7 @@ mod tests {
     }
 
     #[test]
-    fn importing_official_thread_into_active_key_writes_custom_provider() {
+    fn importing_official_thread_into_active_key_writes_configured_provider() {
         let connection = setup_test_connection();
         let key_profile = create_key_profile_record(
             &connection,
@@ -9329,6 +9475,11 @@ mod tests {
         let rollout_path = root.join("sessions/rollout-official-to-key.jsonl");
         fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
             .expect("create sessions dir");
+        fs::write(
+            root.join("config.toml"),
+            "model_provider = \"renamed-provider\"\nmodel = \"gpt-5-codex\"\n",
+        )
+        .expect("write codex config");
         fs::write(
             &rollout_path,
             r#"{"timestamp":"2026-04-26T04:00:00Z","type":"session_meta","payload":{"id":"official-to-key-thread","timestamp":"2026-04-26T04:00:00Z","cwd":"/Users/admin/IdeaProjects/Visora","model_provider":"openai"}}
@@ -9371,7 +9522,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query model provider");
-        assert_eq!(model_provider, "custom");
+        assert_eq!(model_provider, "renamed-provider");
 
         let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
         let first_line = rollout_content.lines().next().expect("rollout meta line");
@@ -9380,7 +9531,7 @@ mod tests {
             meta.get("payload")
                 .and_then(|payload| payload.get("model_provider"))
                 .and_then(Value::as_str),
-            Some("custom")
+            Some("renamed-provider")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -9476,7 +9627,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query model provider");
-        assert_eq!(model_provider, "custom");
+        assert_eq!(model_provider, "oneTop");
 
         let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
         let first_line = rollout_content.lines().next().expect("rollout meta line");
@@ -9485,7 +9636,7 @@ mod tests {
             meta.get("payload")
                 .and_then(|payload| payload.get("model_provider"))
                 .and_then(Value::as_str),
-            Some("custom")
+            Some("oneTop")
         );
 
         let _ = fs::remove_dir_all(root);
