@@ -10,6 +10,7 @@ import {
   recommendedIdentityAsset,
 } from "./pages/identityViewModel";
 import type { IdentityAsset } from "./pages/identityViewModel";
+import { refreshPlanForIdentityAction } from "./pages/identityRefreshPolicy";
 import {
   accountExpectedLoginLabel,
   accountSwitchabilitySummary,
@@ -442,11 +443,13 @@ function App() {
     });
   }
 
-  async function refreshCredentialProfiles() {
+  async function refreshCredentialProfiles(options: { refreshKeyUsage?: boolean } = {}) {
     const profiles = await api.listCredentialProfiles();
     const mergedProfiles = mergeProfilesWithExistingUsage(profiles, credentialProfiles);
     setCredentialProfiles(mergedProfiles);
-    void refreshKeyUsageForProfiles(mergedProfiles).catch(() => undefined);
+    if (options.refreshKeyUsage ?? true) {
+      void refreshKeyUsageForProfiles(mergedProfiles).catch(() => undefined);
+    }
     return mergedProfiles;
   }
 
@@ -738,7 +741,29 @@ function App() {
   }
 
   async function refreshStatusNow() {
-    await sampleNow();
+    const plan = refreshPlanForIdentityAction("refresh-status");
+    setSubmitting(true);
+    setLastOperationError(null);
+    setMessage("正在刷新本地状态...");
+    try {
+      if (plan.credentialProfiles) {
+        await refreshCredentialProfiles({ refreshKeyUsage: plan.keyUsage });
+      }
+      if (plan.overview) {
+        await refreshOverview({
+          includeSupportingData: plan.supportingData,
+          includeSelectedAccountDetail: false,
+          ignoreCooldown: true,
+        });
+      }
+      setMessage("状态已刷新");
+    } catch (error) {
+      const detail = friendlyErrorText(error);
+      setLastOperationError(detail);
+      setMessage(`刷新状态失败：${detail}`);
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   async function importCodexLocalSessions(candidateIds?: string[]) {
@@ -770,12 +795,20 @@ function App() {
   }
 
   async function executeSwitchAccount(id: number) {
+    const plan = refreshPlanForIdentityAction("switch-official-account");
     setSubmitting(true);
     setLastOperationError(null);
     try {
       const data = await api.switchAccount(id);
-      applyOverviewData(data);
-      await loadSupportingData();
+      if (plan.overview) {
+        applyOverviewData(data);
+      }
+      if (plan.credentialProfiles) {
+        await refreshCredentialProfiles({ refreshKeyUsage: plan.keyUsage });
+      }
+      if (plan.supportingData) {
+        await loadSupportingData();
+      }
       setMessage("账号切换成功；状态会在后台马上刷新。");
     } catch (error) {
       const detail = friendlyErrorText(error);
@@ -951,12 +984,22 @@ function App() {
   }
 
   async function activateCredentialProfile(profileId: number) {
+    const plan = refreshPlanForIdentityAction("activate-third-party-key");
     setSubmitting(true);
     setKeyProfileAction({ profileId, kind: "activate" });
     setLastOperationError(null);
     try {
       const profile = await api.activateCredentialProfile(profileId);
-      await refreshCredentialProfiles();
+      if (plan.credentialProfiles) {
+        await refreshCredentialProfiles({ refreshKeyUsage: plan.keyUsage });
+      }
+      if (plan.overview) {
+        await refreshOverview({
+          includeSupportingData: plan.supportingData,
+          includeSelectedAccountDetail: false,
+          ignoreCooldown: true,
+        });
+      }
       if (profile.profile_kind === "third_party_key") {
         setMessage(`${profile.nickname} 已启用，并已写入 Codex auth.json/config.toml`);
       } else {
