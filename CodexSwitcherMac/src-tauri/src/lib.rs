@@ -1675,7 +1675,29 @@ fn apply_background_sampling_outcome(
             }
         }
         RealAccountSamplingOutcome::Expired => {
-            mark_account_auth_invalid(connection, account.id, &now_text)?;
+            if account.is_active {
+                mark_account_auth_invalid(connection, account.id, &now_text)?;
+            } else {
+                connection
+                    .execute(
+                        "UPDATE accounts SET last_check_time = ?1, updated_at = ?1 WHERE id = ?2",
+                        params![now_text, account.id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                if *created_notifications < notification_limit {
+                    insert_account_notification(
+                        connection,
+                        account.id,
+                        "warning",
+                        &format!("{} 绑定快照暂不可读", account.nickname),
+                        "非当前官方账号的绑定快照暂时无法读取真实额度；已保留上一次可信状态，切换或重新登录该账号时会再次校验。",
+                        "real_verification",
+                        "sample_inactive_auth_unconfirmed",
+                        None,
+                    )?;
+                    *created_notifications += 1;
+                }
+            }
         }
     }
 
@@ -2770,6 +2792,57 @@ fn reconcile_runtime_active_identity(connection: &Connection) -> Result<(), Stri
     Ok(())
 }
 
+fn recover_inactive_accounts_with_trusted_snapshot(connection: &Connection) -> Result<(), String> {
+    let mut stmt = connection
+        .prepare(
+            "SELECT id FROM accounts
+             WHERE is_real_session = 1
+               AND binding_kind = 'codex_cli'
+               AND is_active = 0
+               AND status = 'auth_invalid'
+               AND auth_state = 'expired'",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| error.to_string())?;
+    let account_ids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(stmt);
+
+    for account_id in account_ids {
+        let account = query_account_by_id(connection, account_id)?;
+        let Some(snapshot) = account.latest_snapshot.as_ref() else {
+            continue;
+        };
+        if snapshot.source_type != "real_usage" {
+            continue;
+        }
+
+        let Ok(bound_snapshot) = read_bound_session_snapshot(&account) else {
+            continue;
+        };
+        if !bound_snapshot_matches_account(&account, &bound_snapshot) {
+            continue;
+        }
+
+        connection
+            .execute(
+                "UPDATE accounts
+                 SET status = ?1,
+                     auth_state = 'valid',
+                     updated_at = ?2
+                 WHERE id = ?3",
+                params![snapshot.risk_level, now_text(), account_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
 fn sync_account_credential_profiles(connection: &Connection) -> Result<(), String> {
     let has_active_key = connection
         .query_row(
@@ -2860,6 +2933,8 @@ fn sync_account_credential_profiles(connection: &Connection) -> Result<(), Strin
 }
 
 fn query_accounts(connection: &Connection) -> Result<Vec<Account>, String> {
+    recover_inactive_accounts_with_trusted_snapshot(connection)?;
+
     let mut stmt = connection
         .prepare(
             "SELECT id, provider, nickname, status, is_active, is_default, auth_state, last_check_time, estimated_reset_time,
@@ -10503,6 +10578,74 @@ mod tests {
             refreshed.last_check_time.as_deref(),
             Some(sampled_at.as_str())
         );
+    }
+
+    #[test]
+    fn inactive_account_auth_invalid_sampling_keeps_previous_bind_state() {
+        let connection = setup_test_connection();
+        let account = query_account_by_id(&connection, 2).expect("inactive account");
+        assert!(!account.is_active);
+        assert_eq!(account.status, "healthy");
+        assert_eq!(account.auth_state, "valid");
+
+        let mut created_notifications = 0;
+        apply_background_sampling_outcome(
+            &connection,
+            &account,
+            Local::now(),
+            RealAccountSamplingOutcome::Expired,
+            &mut created_notifications,
+            3,
+        )
+        .expect("apply non-active auth invalid sampling outcome");
+
+        let refreshed = query_account_by_id(&connection, 2).expect("refreshed account");
+        assert_eq!(refreshed.status, "healthy");
+        assert_eq!(refreshed.auth_state, "valid");
+        assert_eq!(created_notifications, 1);
+    }
+
+    #[test]
+    fn query_accounts_recovers_inactive_auth_invalid_when_bound_snapshot_is_trusted() {
+        let connection = setup_test_connection();
+        let snapshot_path = unique_temp_file("inactive-trusted-snapshot.json");
+        fs::write(
+            &snapshot_path,
+            r#"{"tokens":{"account_id":"00000000-0000-4000-8000-000000000002"}}"#,
+        )
+        .expect("write trusted snapshot");
+        let sample_at = now_text();
+        connection
+            .execute(
+                "UPDATE accounts
+                 SET status = 'auth_invalid',
+                     auth_state = 'expired',
+                     is_active = 0,
+                     account_key = 'codex-00000000-0000-4000-8000-000000000002',
+                     session_ref = ?1,
+                     profile_ref = '00000000-0000-4000-8000-000000000002',
+                     account_email = 'inactive@example.com'
+                 WHERE id = 2",
+                [snapshot_path.to_string_lossy().to_string()],
+            )
+            .expect("mark inactive account expired");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (2, ?1, 12, 34, 'healthy', NULL, NULL, 'real_usage', '精确', 0, '{\"kind\":\"trusted\"}')",
+                [sample_at],
+            )
+            .expect("insert trusted snapshot");
+
+        let recovered = query_accounts(&connection)
+            .expect("query accounts")
+            .into_iter()
+            .find(|account| account.id == 2)
+            .expect("account 2");
+
+        assert_eq!(recovered.status, "healthy");
+        assert_eq!(recovered.auth_state, "valid");
+        let _ = fs::remove_file(snapshot_path);
     }
 
     #[test]
