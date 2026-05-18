@@ -76,7 +76,7 @@ export type AppPageBodyProps = {
   identityAssets: IdentityAsset[];
   recommendedIdentity: IdentityAsset | null;
   keyProfileDraft: CreateKeyProfileInput;
-  keyProfileAction: { profileId: number | null; kind: "save" | "update" | "activate" } | null;
+  keyProfileAction: { profileId: number | null; kind: "save" | "update" | "activate" | "delete" } | null;
   keyProfileFormFeedback: string;
   hasAuthIssue: (account: Account) => boolean;
   lastOperationError: string | null;
@@ -86,6 +86,7 @@ export type AppPageBodyProps = {
   notifications: NotificationItem[];
   overview: DashboardOverview;
   page: PageKey;
+  pendingDeleteKeyProfileId: number | null;
   pendingRepairAccount: Account | null;
   pendingSwitchAccount: Account | null;
   realAccounts: Account[];
@@ -112,6 +113,7 @@ export type AppPageBodyProps = {
   onCloseSwitchConfirm: () => void;
   onCopyAccountDiagnostic: () => void | Promise<void>;
   onCreateKeyProfile: () => void | Promise<void>;
+  onDeleteKeyProfile: (profile: CredentialProfile) => void | Promise<void>;
   onDiagnoseBindEnvironment: () => void | Promise<void>;
   onExecuteSwitchAccount: (id: number) => void | Promise<void>;
   onImportCodexLocalSessions: (candidateIds?: string[]) => void | Promise<void>;
@@ -224,6 +226,7 @@ export function AppPageBody({
   notifications,
   overview,
   page,
+  pendingDeleteKeyProfileId,
   pendingRepairAccount,
   pendingSwitchAccount,
   realAccounts,
@@ -249,6 +252,7 @@ export function AppPageBody({
   onCloseSwitchConfirm,
   onCopyAccountDiagnostic,
   onCreateKeyProfile,
+  onDeleteKeyProfile,
   onDiagnoseBindEnvironment,
   onExecuteSwitchAccount,
   onImportCodexLocalSessions,
@@ -335,6 +339,7 @@ export function AppPageBody({
           onBeginRepairFlow={onBeginRepairFlow}
           onCancelEditKeyProfile={onCancelEditKeyProfile}
           onCreateKeyProfile={onCreateKeyProfile}
+          onDeleteKeyProfile={onDeleteKeyProfile}
           onDiagnoseBindEnvironment={onDiagnoseBindEnvironment}
           onMakeDefault={onMakeDefault}
           onOpenAccountDetail={onOpenAccountDetail}
@@ -346,6 +351,7 @@ export function AppPageBody({
           onStartLoginFlow={onStartLoginFlow}
           onSwitchAccount={onShowSwitchConfirm}
           onVerifyAccount={onVerifyAccount}
+          pendingDeleteKeyProfileId={pendingDeleteKeyProfileId}
           pendingRepairAccount={pendingRepairAccount}
           realAccounts={realAccounts}
           submitting={submitting}

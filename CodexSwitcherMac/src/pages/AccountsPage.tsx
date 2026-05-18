@@ -31,7 +31,7 @@ type AccountsPageProps = {
   handleBindCurrentAccount: () => void | Promise<void>;
   identityAssets: IdentityAsset[];
   keyProfileDraft: CreateKeyProfileInput;
-  keyProfileAction: { profileId: number | null; kind: "save" | "update" | "activate" } | null;
+  keyProfileAction: { profileId: number | null; kind: "save" | "update" | "activate" | "delete" } | null;
   keyProfileFormFeedback: string;
   lastOperationError: string | null;
   onActivateIdentity: (asset: IdentityAsset) => void | Promise<void>;
@@ -39,6 +39,7 @@ type AccountsPageProps = {
   onBeginRepairFlow: (id: number) => void | Promise<void>;
   onCancelEditKeyProfile: () => void;
   onCreateKeyProfile: () => void | Promise<void>;
+  onDeleteKeyProfile: (profile: CredentialProfile) => void | Promise<void>;
   onDiagnoseBindEnvironment: () => void | Promise<void>;
   onMakeDefault: (id: number) => void | Promise<void>;
   onOpenAccountDetail: (account: Account) => void;
@@ -50,6 +51,7 @@ type AccountsPageProps = {
   onStartLoginFlow: () => void | Promise<void>;
   onSwitchAccount: (id: number) => void | Promise<void>;
   onVerifyAccount: (id: number) => void | Promise<void>;
+  pendingDeleteKeyProfileId: number | null;
   pendingRepairAccount: Account | null;
   realAccounts: Account[];
   submitting: boolean;
@@ -213,7 +215,7 @@ function KeyProfileAssets({
   submitting,
 }: {
   editingKeyProfileId: number | null;
-  keyProfileAction: { profileId: number | null; kind: "save" | "update" | "activate" } | null;
+  keyProfileAction: { profileId: number | null; kind: "save" | "update" | "activate" | "delete" } | null;
   keyProfileFormFeedback: string;
   keyProfileDraft: CreateKeyProfileInput;
   onCancelEditKeyProfile: () => void;
@@ -362,6 +364,7 @@ export function AccountsPage({
   onBeginRepairFlow,
   onCancelEditKeyProfile,
   onCreateKeyProfile,
+  onDeleteKeyProfile,
   onDiagnoseBindEnvironment,
   onMakeDefault,
   onOpenAccountDetail,
@@ -373,6 +376,7 @@ export function AccountsPage({
   onStartLoginFlow,
   onSwitchAccount,
   onVerifyAccount,
+  pendingDeleteKeyProfileId,
   pendingRepairAccount,
   realAccounts,
   submitting,
@@ -443,6 +447,16 @@ export function AccountsPage({
                   >
                     编辑
                   </button>
+                  <button
+                    className="btn btn-danger"
+                    type="button"
+                    disabled={submitting || asset.isActive}
+                    onClick={() => void onDeleteKeyProfile(asset.profile)}
+                  >
+                    {keyProfileAction?.profileId === asset.profile.id && keyProfileAction.kind === "delete"
+                      ? "删除中..."
+                      : pendingDeleteKeyProfileId === asset.profile.id ? "确认删除" : "删除"}
+                  </button>
                 </div>
                 {maskedSecretLooksLikeUrl(asset.profile) ? (
                   <p className="key-profile-feedback error">
@@ -491,7 +505,12 @@ export function AccountsPage({
                       </button>
                     </>
                   ) : null}
-                  <button className="btn btn-danger" type="button" onClick={() => void onRemoveAccount(asset.account!.id)}>
+                  <button
+                    className="btn btn-danger"
+                    type="button"
+                    onClick={() => void onRemoveAccount(asset.account!.id)}
+                    disabled={submitting || asset.account.is_active || currentLoginMatchesAccount(currentLogin, asset.account)}
+                  >
                     删除
                   </button>
                 </div>

@@ -56,7 +56,7 @@ type AppContentProps = {
   identityAssets: IdentityAsset[];
   recommendedIdentity: IdentityAsset | null;
   keyProfileDraft: CreateKeyProfileInput;
-  keyProfileAction: { profileId: number | null; kind: "save" | "update" | "activate" } | null;
+  keyProfileAction: { profileId: number | null; kind: "save" | "update" | "activate" | "delete" } | null;
   keyProfileFormFeedback: string;
   hasAuthIssue: (account: Account) => boolean;
   lastOperationError: string | null;
@@ -67,6 +67,7 @@ type AppContentProps = {
   notifications: NotificationItem[];
   overview: DashboardOverview | null;
   page: PageKey;
+  pendingDeleteKeyProfileId: number | null;
   pendingRepairAccount: Account | null;
   pendingSwitchAccount: Account | null;
   realAccounts: Account[];
@@ -93,6 +94,7 @@ type AppContentProps = {
   onCloseSwitchConfirm: () => void;
   onCopyAccountDiagnostic: () => void | Promise<void>;
   onCreateKeyProfile: () => void | Promise<void>;
+  onDeleteKeyProfile: (profile: CredentialProfile) => void | Promise<void>;
   onDiagnoseBindEnvironment: () => void | Promise<void>;
   onExecuteSwitchAccount: (id: number) => void | Promise<void>;
   onImportCodexLocalSessions: (candidateIds?: string[]) => void | Promise<void>;
@@ -158,6 +160,7 @@ export function AppContent({
   notifications,
   overview,
   page,
+  pendingDeleteKeyProfileId,
   pendingRepairAccount,
   pendingSwitchAccount,
   realAccounts,
@@ -184,6 +187,7 @@ export function AppContent({
   onCloseSwitchConfirm,
   onCopyAccountDiagnostic,
   onCreateKeyProfile,
+  onDeleteKeyProfile,
   onDiagnoseBindEnvironment,
   onExecuteSwitchAccount,
   onImportCodexLocalSessions,
@@ -346,6 +350,7 @@ export function AppContent({
       notifications={notifications}
       overview={overview!}
       page={page}
+      pendingDeleteKeyProfileId={pendingDeleteKeyProfileId}
       pendingRepairAccount={pendingRepairAccount}
       pendingSwitchAccount={pendingSwitchAccount}
       realAccounts={realAccounts}
@@ -372,6 +377,7 @@ export function AppContent({
       onCloseSwitchConfirm={onCloseSwitchConfirm}
       onCopyAccountDiagnostic={onCopyAccountDiagnostic}
       onCreateKeyProfile={onCreateKeyProfile}
+      onDeleteKeyProfile={onDeleteKeyProfile}
       onDiagnoseBindEnvironment={onDiagnoseBindEnvironment}
       onExecuteSwitchAccount={onExecuteSwitchAccount}
       onImportCodexLocalSessions={onImportCodexLocalSessions}

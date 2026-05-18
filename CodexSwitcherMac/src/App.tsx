@@ -120,7 +120,8 @@ function App() {
   const [credentialProfiles, setCredentialProfiles] = useState<CredentialProfile[]>([]);
   const [keyProfileDraft, setKeyProfileDraft] = useState<CreateKeyProfileInput>(emptyKeyProfileForm);
   const [editingKeyProfileId, setEditingKeyProfileId] = useState<number | null>(null);
-  const [keyProfileAction, setKeyProfileAction] = useState<{ profileId: number | null; kind: "save" | "update" | "activate" } | null>(null);
+  const [pendingDeleteKeyProfileId, setPendingDeleteKeyProfileId] = useState<number | null>(null);
+  const [keyProfileAction, setKeyProfileAction] = useState<{ profileId: number | null; kind: "save" | "update" | "activate" | "delete" } | null>(null);
   const [keyProfileFormFeedback, setKeyProfileFormFeedback] = useState("");
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -697,6 +698,11 @@ function App() {
   }
 
   async function removeAccount(id: number) {
+    const account = accounts.find((item) => item.id === id);
+    if (account?.is_active || (account && currentLoginMatchesAccount(currentLogin, account))) {
+      setMessage("当前登录的官方账号不能删除，请先切换到其他身份。");
+      return;
+    }
     setSubmitting(true);
     try {
       await api.deleteAccount(id);
@@ -953,6 +959,7 @@ function App() {
   }
 
   function beginEditKeyProfile(profile: CredentialProfile) {
+    setPendingDeleteKeyProfileId(null);
     setEditingKeyProfileId(profile.id);
     setKeyProfileDraft({
       provider: profile.provider,
@@ -971,6 +978,7 @@ function App() {
 
   function cancelEditKeyProfile() {
     setEditingKeyProfileId(null);
+    setPendingDeleteKeyProfileId(null);
     setKeyProfileDraft(emptyKeyProfileForm);
     setKeyProfileFormFeedback("");
     setMessage("已取消编辑 key");
@@ -1012,6 +1020,45 @@ function App() {
     } finally {
       setSubmitting(false);
       setKeyProfileAction(null);
+    }
+  }
+
+  async function deleteKeyProfile(profile: CredentialProfile) {
+    if (profile.profile_kind !== "third_party_key") {
+      setMessage("官方账号资产不能删除。");
+      return;
+    }
+    if (profile.is_active) {
+      setMessage("当前登录的 Key 不能删除，请先切换到其他身份。");
+      return;
+    }
+
+    if (pendingDeleteKeyProfileId !== profile.id) {
+      setPendingDeleteKeyProfileId(profile.id);
+      setMessage(`再次点击“确认删除”将删除 ${profile.nickname}，并移除本机保存的 Keychain 凭证。`);
+      return;
+    }
+
+    setSubmitting(true);
+    setKeyProfileAction({ profileId: profile.id, kind: "delete" });
+    setLastOperationError(null);
+    try {
+      await api.deleteCredentialProfile(profile.id);
+      await refreshCredentialProfiles();
+      if (editingKeyProfileId === profile.id) {
+        setEditingKeyProfileId(null);
+        setKeyProfileDraft(emptyKeyProfileForm);
+        setKeyProfileFormFeedback("");
+      }
+      setMessage(`${profile.nickname} 已删除`);
+    } catch (error) {
+      const detail = friendlyErrorText(error);
+      setLastOperationError(detail);
+      setMessage(`删除 Key 失败：${detail}`);
+    } finally {
+      setSubmitting(false);
+      setKeyProfileAction(null);
+      setPendingDeleteKeyProfileId(null);
     }
   }
 
@@ -1171,6 +1218,7 @@ function App() {
           notifications={notifications}
           overview={overview}
           page={page}
+          pendingDeleteKeyProfileId={pendingDeleteKeyProfileId}
           pendingRepairAccount={pendingRepairAccount}
           pendingSwitchAccount={pendingSwitchAccount}
           realAccounts={realAccounts}
@@ -1197,6 +1245,7 @@ function App() {
           onCloseSwitchConfirm={() => setPendingSwitchAccount(null)}
           onCopyAccountDiagnostic={copyAccountDiagnostic}
           onCreateKeyProfile={createKeyProfile}
+          onDeleteKeyProfile={deleteKeyProfile}
           onDiagnoseBindEnvironment={diagnoseBindEnvironment}
           onExecuteSwitchAccount={executeSwitchAccount}
           onImportCodexLocalSessions={importCodexLocalSessions}

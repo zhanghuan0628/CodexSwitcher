@@ -674,6 +674,19 @@ export const browserPreviewApi = {
     });
     return clone(profile);
   },
+  deleteCredentialProfile(profileId: number): void {
+    const profile = state.credentialProfiles.find((item) => item.id === profileId);
+    if (!profile) {
+      throw new Error(`未找到凭证身份 #${profileId}`);
+    }
+    if (profile.profile_kind !== "third_party_key") {
+      throw new Error("官方账号资产不能删除。");
+    }
+    if (profile.is_active) {
+      throw new Error("当前登录的 Key 不能删除，请先切换到其他身份。");
+    }
+    state.credentialProfiles = state.credentialProfiles.filter((item) => item.id !== profileId);
+  },
   getAccountDetail(id: number): AccountDetail {
     return buildAccountDetail(id);
   },
@@ -738,6 +751,17 @@ export const browserPreviewApi = {
     return clone(account);
   },
   deleteAccount(id: number): void {
+    const account = state.accounts.find((item) => item.id === id);
+    if (account?.is_active) {
+      throw new Error("当前登录的官方账号不能删除，请先切换到其他身份。");
+    }
+    const currentLoginMatches = Boolean(account && state.currentLogin.logged_in && (
+      (state.currentLogin.email && account.account_email === state.currentLogin.email)
+      || (state.currentLogin.account_id && account.profile_ref === state.currentLogin.account_id)
+    ));
+    if (currentLoginMatches) {
+      throw new Error("当前登录的官方账号不能删除，请先切换到其他身份。");
+    }
     state.accounts = state.accounts.filter((account) => account.id !== id);
     if (!activeAccount() && state.accounts[0]) {
       state.accounts[0].is_active = true;

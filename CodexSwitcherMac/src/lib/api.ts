@@ -79,6 +79,12 @@ export const api = {
       { profileId },
       () => browserPreviewApi.activateCredentialProfile(profileId),
     ),
+  deleteCredentialProfile: (profileId: number) =>
+    invokeOrPreview<void>(
+      "delete_credential_profile",
+      { profileId },
+      () => browserPreviewApi.deleteCredentialProfile(profileId),
+    ),
   getAccountDetail: (id: number) =>
     invokeOrPreview<AccountDetail>("get_account_detail", { id }, () => browserPreviewApi.getAccountDetail(id)),
   startCodexLoginFlow: () =>

@@ -2097,6 +2097,36 @@ fn update_key_profile_usage_config_record(
     query_credential_profile_by_id(connection, input.profile_id)
 }
 
+fn delete_profile_secret_ref(secret_ref: Option<&str>) -> Result<(), String> {
+    if let Some(account_key) = secret_ref.and_then(keychain_account_key) {
+        delete_account_secret(account_key)?;
+    }
+    Ok(())
+}
+
+fn delete_credential_profile_record(connection: &Connection, profile_id: i64) -> Result<(), String> {
+    let profile = query_credential_profile_by_id(connection, profile_id)?;
+    if profile.profile_kind != "third_party_key" {
+        return Err("官方账号资产不能删除。".to_string());
+    }
+    if profile.is_active {
+        return Err("当前登录的 Key 不能删除，请先切换到其他身份。".to_string());
+    }
+
+    delete_profile_secret_ref(profile.secret_ref.as_deref())?;
+    delete_profile_secret_ref(profile.usage_secret_ref.as_deref())?;
+
+    connection
+        .execute(
+            "DELETE FROM credential_profiles
+             WHERE id = ?1 AND profile_kind = 'third_party_key'",
+            [profile_id],
+        )
+        .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
 fn query_credential_profiles(connection: &Connection) -> Result<Vec<CredentialProfile>, String> {
     sync_account_credential_profiles(connection)?;
 
@@ -6677,6 +6707,16 @@ fn activate_credential_profile(
 }
 
 #[tauri::command]
+fn delete_credential_profile(profile_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| "数据库锁获取失败".to_string())?;
+    reconcile_runtime_active_identity(&connection)?;
+    delete_credential_profile_record(&connection, profile_id)
+}
+
+#[tauri::command]
 fn get_account_detail(id: i64, state: State<'_, AppState>) -> Result<AccountDetail, String> {
     let connection = state
         .db
@@ -6685,27 +6725,64 @@ fn get_account_detail(id: i64, state: State<'_, AppState>) -> Result<AccountDeta
     build_account_detail(&connection, id)
 }
 
-#[tauri::command]
-fn delete_account(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let connection = state
-        .db
-        .lock()
-        .map_err(|_| "数据库锁获取失败".to_string())?;
-    let account = query_account_by_id(&connection, id)?;
-    let is_active = account.is_active;
+fn current_login_matches_account(current_login: Option<&CurrentCodexLogin>, account: &Account) -> bool {
+    let Some(current_login) = current_login else {
+        return false;
+    };
+    if !current_login.logged_in {
+        return false;
+    }
+    current_login
+        .email
+        .as_deref()
+        .is_some_and(|email| account.account_email.as_deref() == Some(email))
+        || current_login
+            .account_id
+            .as_deref()
+            .is_some_and(|account_id| account.profile_ref.as_deref() == Some(account_id))
+}
+
+fn delete_account_record(
+    connection: &Connection,
+    id: i64,
+    current_login: Option<&CurrentCodexLogin>,
+) -> Result<(), String> {
+    let account = query_account_by_id(connection, id)?;
+    if account.is_active {
+        return Err("当前登录的官方账号不能删除，请先切换到其他身份。".to_string());
+    }
+    if current_login_matches_account(current_login, &account) {
+        return Err("当前登录的官方账号不能删除，请先切换到其他身份。".to_string());
+    }
 
     connection
         .execute("DELETE FROM accounts WHERE id = ?1", [id])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM credential_profiles
+             WHERE profile_kind = 'official_account' AND linked_account_id = ?1",
+            [id],
+        )
         .map_err(|error| error.to_string())?;
 
     if account.is_real_session && !account.session_ref.is_empty() {
         delete_session_snapshot(&account.session_ref)?;
     }
 
-    if is_active {
-        ensure_one_active(&connection)?;
-    }
     Ok(())
+}
+
+#[tauri::command]
+fn delete_account(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| "数据库锁获取失败".to_string())?;
+    reconcile_runtime_active_identity(&connection)?;
+    let accounts = query_accounts(&connection)?;
+    let current_login = current_codex_login(&accounts);
+    delete_account_record(&connection, id, current_login.as_ref())
 }
 
 #[tauri::command]
@@ -8743,6 +8820,114 @@ mod tests {
     }
 
     #[test]
+    fn deleting_inactive_third_party_key_profile_removes_only_that_profile() {
+        let connection = setup_test_connection();
+        sync_account_credential_profiles(&connection).expect("sync official profiles");
+        let key_profile = create_key_profile_record(
+            &connection,
+            CreateKeyProfileInput {
+                provider: "custom".to_string(),
+                nickname: "可删除 Key".to_string(),
+                base_url: "https://sub2api.yuchat.top".to_string(),
+                model: "gpt-5-codex".to_string(),
+                api_key: "example-api-key-1234567890abcdef".to_string(),
+            },
+            "keychain://key-profile-delete-test",
+        )
+        .expect("create key profile");
+
+        delete_credential_profile_record(&connection, key_profile.id).expect("delete inactive key");
+
+        let key_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM credential_profiles WHERE id = ?1",
+                [key_profile.id],
+                |row| row.get(0),
+            )
+            .expect("count deleted key");
+        assert_eq!(key_count, 0);
+
+        let official_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM credential_profiles WHERE profile_kind = 'official_account'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count official profiles");
+        assert_eq!(official_count, 3);
+    }
+
+    #[test]
+    fn deleting_active_third_party_key_profile_is_blocked() {
+        let connection = setup_test_connection();
+        let key_profile = create_key_profile_record(
+            &connection,
+            CreateKeyProfileInput {
+                provider: "custom".to_string(),
+                nickname: "当前 Key".to_string(),
+                base_url: "https://sub2api.yuchat.top".to_string(),
+                model: "gpt-5-codex".to_string(),
+                api_key: "example-api-key-1234567890abcdef".to_string(),
+            },
+            "keychain://key-profile-active-delete-test",
+        )
+        .expect("create key profile");
+        activate_credential_profile_record(&connection, key_profile.id).expect("activate key");
+
+        let reason = delete_credential_profile_record(&connection, key_profile.id)
+            .expect_err("active key should not be deleted");
+        assert!(reason.contains("当前登录的 Key"));
+    }
+
+    #[test]
+    fn deleting_current_official_account_is_blocked() {
+        let connection = setup_test_connection();
+        let current_login = CurrentCodexLogin {
+            logged_in: true,
+            email: Some("demo@example.com".to_string()),
+            account_id: Some("profile-1".to_string()),
+            is_bound: true,
+        };
+        connection
+            .execute(
+                "UPDATE accounts
+                 SET is_active = 0,
+                     profile_ref = ?1,
+                     account_email = ?2
+                 WHERE id = 2",
+                params!["profile-1", "demo@example.com"],
+            )
+            .expect("mark account as current login");
+
+        let reason = delete_account_record(&connection, 2, Some(&current_login))
+            .expect_err("current official account should not be deleted");
+        assert!(reason.contains("当前登录的官方账号"));
+    }
+
+    #[test]
+    fn deleting_inactive_official_account_removes_mirrored_profile() {
+        let connection = setup_test_connection();
+        sync_account_credential_profiles(&connection).expect("sync official profiles");
+
+        delete_account_record(&connection, 2, None).expect("delete inactive official account");
+
+        let account_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM accounts WHERE id = 2", [], |row| row.get(0))
+            .expect("count deleted account");
+        assert_eq!(account_count, 0);
+
+        let profile_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM credential_profiles
+                 WHERE profile_kind = 'official_account' AND linked_account_id = 2",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count deleted official profile");
+        assert_eq!(profile_count, 0);
+    }
+
+    #[test]
     fn ensure_one_active_does_not_restore_account_when_key_is_active() {
         let connection = setup_test_connection();
         let key_profile = create_key_profile_record(
@@ -10702,6 +10887,7 @@ pub fn run() {
             create_key_profile,
             update_key_profile,
             activate_credential_profile,
+            delete_credential_profile,
             get_account_detail,
             start_codex_login_flow,
             bind_current_codex_account,
