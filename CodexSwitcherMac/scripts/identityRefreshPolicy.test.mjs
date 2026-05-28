@@ -28,13 +28,13 @@ test("third-party key activation refreshes both identity sources without key usa
   });
 });
 
-test("manual status refresh stays lightweight and separate from explicit sampling", () => {
+test("manual status refresh samples real usage so reset windows are refreshed", () => {
   assert.deepEqual(refreshPlanForIdentityAction("refresh-status"), {
     overview: true,
     credentialProfiles: true,
     keyUsage: false,
-    supportingData: false,
-    sampling: false,
+    supportingData: true,
+    sampling: true,
   });
 
   assert.equal(refreshPlanForIdentityAction("sample-now").sampling, true);

@@ -2873,6 +2873,44 @@ fn recover_inactive_accounts_with_trusted_snapshot(connection: &Connection) -> R
     Ok(())
 }
 
+fn exhausted_snapshot_reset_due_at(
+    snapshot: &UsageSnapshot,
+    now: chrono::DateTime<Local>,
+) -> bool {
+    if snapshot.risk_level != "exhausted" {
+        return false;
+    }
+
+    let exhausted_windows = [
+        (
+            snapshot.window_5h_percent,
+            snapshot.estimated_reset_5h_at.as_deref(),
+        ),
+        (
+            snapshot.window_7d_percent,
+            snapshot.estimated_reset_7d_at.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(percent, _)| *percent >= 100)
+    .collect::<Vec<_>>();
+
+    !exhausted_windows.is_empty()
+        && exhausted_windows.into_iter().all(|(_, reset_at)| {
+            reset_at
+                .and_then(parse_local_datetime_text)
+                .is_some_and(|reset_at| reset_at <= now)
+        })
+}
+
+fn effective_account_status_from_snapshot(snapshot: &UsageSnapshot) -> String {
+    if exhausted_snapshot_reset_due_at(snapshot, Local::now()) {
+        "warning".to_string()
+    } else {
+        snapshot.risk_level.clone()
+    }
+}
+
 fn sync_account_credential_profiles(connection: &Connection) -> Result<(), String> {
     let has_active_key = connection
         .query_row(
@@ -3008,7 +3046,7 @@ fn query_accounts(connection: &Connection) -> Result<Vec<Account>, String> {
         account.plan_label = query_latest_account_plan_label(connection, account.id)?;
         if let Some(snapshot) = &account.latest_snapshot {
             if account.auth_state == "valid" && snapshot.source_type == "real_usage" {
-                account.status = snapshot.risk_level.clone();
+                account.status = effective_account_status_from_snapshot(snapshot);
             }
         }
     }
@@ -6236,7 +6274,7 @@ fn query_account_by_id(connection: &Connection, id: i64) -> Result<Account, Stri
     account.plan_label = query_latest_account_plan_label(connection, id)?;
     if let Some(snapshot) = &account.latest_snapshot {
         if account.auth_state == "valid" && snapshot.source_type == "real_usage" {
-            account.status = snapshot.risk_level.clone();
+            account.status = effective_account_status_from_snapshot(snapshot);
         }
     }
     Ok(account)
@@ -10831,6 +10869,66 @@ mod tests {
         assert_eq!(recovered.status, "healthy");
         assert_eq!(recovered.auth_state, "valid");
         let _ = fs::remove_file(snapshot_path);
+    }
+
+    #[test]
+    fn expired_exhausted_reset_window_becomes_switchable_warning() {
+        let connection = setup_test_connection();
+        let past_reset = (Local::now() - Duration::minutes(5))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        connection
+            .execute("DELETE FROM usage_snapshots WHERE account_id = 2", [])
+            .expect("clear account snapshots");
+        connection
+            .execute(
+                "UPDATE accounts SET status = 'exhausted', auth_state = 'valid', is_real_session = 1, binding_kind = 'codex_cli', updated_at = ?1 WHERE id = 2",
+                params![now_text()],
+            )
+            .expect("mark account exhausted");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (2, ?1, 100, 0, 'exhausted', ?2, NULL, 'real_usage', '精确', 0, '{\"kind\":\"reset_due\"}')",
+                params![now_text(), past_reset],
+            )
+            .expect("insert exhausted snapshot");
+
+        let recovered = query_account_by_id(&connection, 2).expect("query account");
+
+        assert_eq!(recovered.status, "warning");
+        assert!(is_switchable(&recovered).is_ok());
+    }
+
+    #[test]
+    fn future_exhausted_reset_window_stays_blocked() {
+        let connection = setup_test_connection();
+        let future_reset = (Local::now() + Duration::minutes(30))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        connection
+            .execute("DELETE FROM usage_snapshots WHERE account_id = 2", [])
+            .expect("clear account snapshots");
+        connection
+            .execute(
+                "UPDATE accounts SET status = 'exhausted', auth_state = 'valid', is_real_session = 1, binding_kind = 'codex_cli', updated_at = ?1 WHERE id = 2",
+                params![now_text()],
+            )
+            .expect("mark account exhausted");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (2, ?1, 100, 0, 'exhausted', ?2, NULL, 'real_usage', '精确', 0, '{\"kind\":\"reset_pending\"}')",
+                params![now_text(), future_reset],
+            )
+            .expect("insert exhausted snapshot");
+
+        let blocked = query_account_by_id(&connection, 2).expect("query account");
+
+        assert_eq!(blocked.status, "exhausted");
+        assert!(is_switchable(&blocked).is_err());
     }
 
     #[test]

@@ -28,8 +28,15 @@ export function refreshPlanForIdentityAction(action: IdentityRefreshAction): Ide
         supportingData: true,
       };
     case "activate-third-party-key":
-    case "refresh-status":
       return lightIdentitySync;
+    case "refresh-status":
+      return {
+        overview: true,
+        credentialProfiles: true,
+        keyUsage: false,
+        supportingData: true,
+        sampling: true,
+      };
     case "sample-now":
       return {
         overview: true,

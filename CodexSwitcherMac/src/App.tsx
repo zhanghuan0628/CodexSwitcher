@@ -752,8 +752,14 @@ function App() {
     setLastOperationError(null);
     setMessage("正在刷新本地状态...");
     try {
+      let samplingMessage: string | null = null;
       if (plan.credentialProfiles) {
         await refreshCredentialProfiles({ refreshKeyUsage: plan.keyUsage });
+      }
+      if (plan.sampling) {
+        const data = await api.triggerSampling();
+        applyOverviewData(data);
+        samplingMessage = data.latest_sampling.message;
       }
       if (plan.overview) {
         await refreshOverview({
@@ -762,7 +768,7 @@ function App() {
           ignoreCooldown: true,
         });
       }
-      setMessage("状态已刷新");
+      setMessage(samplingMessage ?? "状态已刷新");
     } catch (error) {
       const detail = friendlyErrorText(error);
       setLastOperationError(detail);
