@@ -45,11 +45,10 @@ use tauri::{
     tray::{TrayIconBuilder, TrayIconEvent},
     Manager, State, WebviewWindow, WindowEvent,
 };
-#[cfg(test)]
-use usage::query_latest_real_usage_snapshot;
 use usage::{
-    insert_real_usage_snapshot, query_latest_snapshot, read_real_usage_from_credentials,
-    RealUsageReadError, RealUsageReadErrorKind, RealUsageReading, UsageSnapshot,
+    insert_real_usage_snapshot, query_latest_real_usage_snapshot, query_latest_snapshot,
+    read_real_usage_from_credentials, RealUsageReadError, RealUsageReadErrorKind, RealUsageReading,
+    UsageSnapshot,
 };
 
 const TRAY_ID: &str = "codexswitcher-menu";
@@ -1420,6 +1419,22 @@ fn cleanup_legacy_demo_data(connection: &Connection) -> Result<(), String> {
     connection
         .execute(
             "DELETE FROM usage_snapshots WHERE source_type != 'real_usage' OR is_estimated = 1",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+
+    connection
+        .execute(
+            "DELETE FROM usage_snapshots
+             WHERE source_type = 'real_usage'
+               AND is_estimated = 0
+               AND window_5h_percent = 0
+               AND window_7d_percent = 0
+               AND (
+                   COALESCE(json_extract(raw_meta_json, '$.payload.rate_limit.primary_window.limit_window_seconds'), 0) <= 0
+                   OR json_type(raw_meta_json, '$.payload.rate_limit.secondary_window') IS NULL
+                   OR json_type(raw_meta_json, '$.payload.rate_limit.secondary_window') = 'null'
+               )",
             [],
         )
         .map_err(|error| error.to_string())?;
@@ -3042,7 +3057,7 @@ fn query_accounts(connection: &Connection) -> Result<Vec<Account>, String> {
         .map_err(|error| error.to_string())?;
 
     for account in &mut accounts {
-        account.latest_snapshot = query_latest_snapshot(connection, account.id)?;
+        account.latest_snapshot = query_latest_real_usage_snapshot(connection, account.id)?;
         account.plan_label = query_latest_account_plan_label(connection, account.id)?;
         if let Some(snapshot) = &account.latest_snapshot {
             if account.auth_state == "valid" && snapshot.source_type == "real_usage" {
@@ -5503,8 +5518,7 @@ fn latest_display_snapshot(
     connection: &Connection,
     account: &Account,
 ) -> Result<Option<UsageSnapshot>, String> {
-    let latest = query_latest_snapshot(connection, account.id)?;
-    Ok(latest.filter(|snapshot| snapshot.source_type == "real_usage" && !snapshot.is_estimated))
+    query_latest_real_usage_snapshot(connection, account.id)
 }
 
 #[derive(Debug, Clone)]
@@ -6270,7 +6284,7 @@ fn query_account_by_id(connection: &Connection, id: i64) -> Result<Account, Stri
         )
         .map_err(|_| "目标账号不存在".to_string())?;
 
-    account.latest_snapshot = query_latest_snapshot(connection, id)?;
+    account.latest_snapshot = query_latest_real_usage_snapshot(connection, id)?;
     account.plan_label = query_latest_account_plan_label(connection, id)?;
     if let Some(snapshot) = &account.latest_snapshot {
         if account.auth_state == "valid" && snapshot.source_type == "real_usage" {
@@ -10472,6 +10486,16 @@ mod tests {
                 params![now_text()],
             )
             .expect("insert mock snapshot");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (1, ?1, 0, 0, 'healthy', NULL, NULL, 'real_usage', '精确', 0, ?2)",
+                params![
+                    now_text(),
+                    r#"{"payload":{"rate_limit":{"primary_window":{"limit_window_seconds":0,"used_percent":0},"secondary_window":null}}}"#,
+                ],
+            )
+            .expect("insert incomplete zero snapshot");
 
         cleanup_legacy_demo_data(&connection).expect("cleanup legacy demo data");
 
@@ -10481,9 +10505,21 @@ mod tests {
         let mock_snapshot_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM usage_snapshots WHERE source_type != 'real_usage' OR is_estimated = 1", [], |row| row.get(0))
             .expect("count mock snapshots");
+        let incomplete_zero_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_snapshots
+                 WHERE source_type = 'real_usage'
+                   AND window_5h_percent = 0
+                   AND window_7d_percent = 0
+                   AND json_type(raw_meta_json, '$.payload.rate_limit.secondary_window') = 'null'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count incomplete zero snapshots");
 
         assert_eq!(manual_count, 0);
         assert_eq!(mock_snapshot_count, 0);
+        assert_eq!(incomplete_zero_count, 0);
     }
 
     #[test]

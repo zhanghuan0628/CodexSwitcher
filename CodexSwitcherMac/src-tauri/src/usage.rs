@@ -117,6 +117,8 @@ struct WhamUsageWindow {
     used_percent: Option<f64>,
     #[serde(default)]
     reset_at: Option<i64>,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
 }
 
 pub(crate) fn usage_risk_from_windows(
@@ -142,8 +144,12 @@ fn parse_real_usage_read_state(credentials_json: &str) -> Result<RealUsageReadSt
     Ok(RealUsageReadState::Ready(token))
 }
 
-fn round_percent(value: Option<f64>) -> i64 {
-    value.unwrap_or(0.0).round().clamp(0.0, 100.0) as i64
+fn required_percent(value: Option<f64>) -> Option<i64> {
+    value.map(|percent| percent.round().clamp(0.0, 100.0) as i64)
+}
+
+fn has_valid_window_duration(window: &WhamUsageWindow) -> bool {
+    window.limit_window_seconds.unwrap_or(0) > 0
 }
 
 fn unix_seconds_to_local_text(value: Option<i64>) -> Option<String> {
@@ -357,17 +363,23 @@ pub(crate) fn read_real_usage_from_credentials(
     let Some(primary) = rate_limit.primary_window else {
         return Ok(None);
     };
+    if !has_valid_window_duration(&primary) {
+        return Ok(None);
+    }
 
-    let window_5h_percent = round_percent(primary.used_percent);
-    let (window_7d_percent, estimated_reset_7d_at) =
-        if let Some(secondary) = rate_limit.secondary_window {
-            (
-                round_percent(secondary.used_percent),
-                unix_seconds_to_local_text(secondary.reset_at),
-            )
-        } else {
-            (0, None)
-        };
+    let Some(window_5h_percent) = required_percent(primary.used_percent) else {
+        return Ok(None);
+    };
+    let Some(secondary) = rate_limit.secondary_window else {
+        return Ok(None);
+    };
+    if !has_valid_window_duration(&secondary) {
+        return Ok(None);
+    }
+    let Some(window_7d_percent) = required_percent(secondary.used_percent) else {
+        return Ok(None);
+    };
+    let estimated_reset_7d_at = unix_seconds_to_local_text(secondary.reset_at);
 
     Ok(Some(RealUsageReading {
         window_5h_percent,
@@ -460,19 +472,74 @@ pub(crate) fn query_latest_snapshot(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn query_latest_real_usage_snapshot(
     connection: &Connection,
     account_id: i64,
 ) -> Result<Option<UsageSnapshot>, String> {
-    let latest = query_latest_snapshot(connection, account_id)?;
-    Ok(latest.filter(|snapshot| snapshot.source_type == "real_usage" && !snapshot.is_estimated))
+    let mut stmt = connection
+        .prepare(
+            "SELECT account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json
+             FROM usage_snapshots
+             WHERE account_id = ?1 AND source_type = 'real_usage' AND is_estimated = 0
+             ORDER BY id DESC LIMIT 20",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut rows = stmt
+        .query([account_id])
+        .map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let snapshot = UsageSnapshot {
+            account_id: row.get(0).map_err(|error| error.to_string())?,
+            sample_time: row.get(1).map_err(|error| error.to_string())?,
+            window_5h_percent: row.get(2).map_err(|error| error.to_string())?,
+            window_7d_percent: row.get(3).map_err(|error| error.to_string())?,
+            risk_level: row.get(4).map_err(|error| error.to_string())?,
+            estimated_reset_5h_at: row.get(5).map_err(|error| error.to_string())?,
+            estimated_reset_7d_at: row.get(6).map_err(|error| error.to_string())?,
+            source_type: row.get(7).map_err(|error| error.to_string())?,
+            confidence_level: row.get(8).map_err(|error| error.to_string())?,
+            is_estimated: row.get::<_, i64>(9).map_err(|error| error.to_string())? == 1,
+        };
+        let raw_meta_json: String = row.get(10).map_err(|error| error.to_string())?;
+        if is_incomplete_zero_usage_snapshot(&snapshot, &raw_meta_json) {
+            continue;
+        }
+        return Ok(Some(snapshot));
+    }
+
+    Ok(None)
+}
+
+fn is_incomplete_zero_usage_snapshot(snapshot: &UsageSnapshot, raw_meta_json: &str) -> bool {
+    if snapshot.window_5h_percent != 0 || snapshot.window_7d_percent != 0 {
+        return false;
+    }
+
+    let Ok(meta) = serde_json::from_str::<Value>(raw_meta_json) else {
+        return false;
+    };
+    let Some(rate_limit) = meta.get("payload").and_then(|payload| payload.get("rate_limit")) else {
+        return false;
+    };
+    let primary_duration = rate_limit
+        .get("primary_window")
+        .and_then(|window| window.get("limit_window_seconds"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let secondary_missing = rate_limit
+        .get("secondary_window")
+        .map(Value::is_null)
+        .unwrap_or(true);
+
+    primary_duration <= 0 || secondary_missing
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+    use rusqlite::Connection;
     use std::error::Error;
     use std::fmt::{Display, Formatter};
 
@@ -554,5 +621,117 @@ mod tests {
             1,
             3
         ));
+    }
+
+    #[test]
+    fn required_percent_rejects_missing_usage_values() {
+        assert_eq!(required_percent(Some(12.4)), Some(12));
+        assert_eq!(required_percent(Some(150.0)), Some(100));
+        assert_eq!(required_percent(None), None);
+    }
+
+    #[test]
+    fn usage_window_requires_positive_duration() {
+        assert!(has_valid_window_duration(&WhamUsageWindow {
+            used_percent: Some(1.0),
+            reset_at: None,
+            limit_window_seconds: Some(18_000),
+        }));
+        assert!(!has_valid_window_duration(&WhamUsageWindow {
+            used_percent: Some(0.0),
+            reset_at: None,
+            limit_window_seconds: Some(0),
+        }));
+    }
+
+    #[test]
+    fn latest_real_usage_snapshot_skips_newer_non_display_rows() {
+        let connection = Connection::open_in_memory().expect("connection");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE usage_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    sample_time TEXT NOT NULL,
+                    window_5h_percent INTEGER NOT NULL,
+                    window_7d_percent INTEGER NOT NULL,
+                    risk_level TEXT NOT NULL,
+                    estimated_reset_5h_at TEXT,
+                    estimated_reset_7d_at TEXT,
+                    source_type TEXT NOT NULL,
+                    confidence_level TEXT NOT NULL,
+                    is_estimated INTEGER NOT NULL,
+                    raw_meta_json TEXT NOT NULL
+                );
+                ",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (1, '2026-06-03 10:00:00', 58, 41, 'healthy', NULL, NULL, 'real_usage', '精确', 0, '{}')",
+                [],
+            )
+            .expect("real snapshot");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (1, '2026-06-03 10:05:00', 0, 0, 'healthy', NULL, NULL, 'real_usage', '待校验', 1, '{}')",
+                [],
+            )
+            .expect("estimated snapshot");
+
+        let snapshot = query_latest_real_usage_snapshot(&connection, 1)
+            .expect("query")
+            .expect("snapshot");
+        assert_eq!(snapshot.window_5h_percent, 58);
+        assert_eq!(snapshot.window_7d_percent, 41);
+        assert!(!snapshot.is_estimated);
+    }
+
+    #[test]
+    fn latest_real_usage_snapshot_skips_incomplete_zero_rows() {
+        let connection = Connection::open_in_memory().expect("connection");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE usage_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    sample_time TEXT NOT NULL,
+                    window_5h_percent INTEGER NOT NULL,
+                    window_7d_percent INTEGER NOT NULL,
+                    risk_level TEXT NOT NULL,
+                    estimated_reset_5h_at TEXT,
+                    estimated_reset_7d_at TEXT,
+                    source_type TEXT NOT NULL,
+                    confidence_level TEXT NOT NULL,
+                    is_estimated INTEGER NOT NULL,
+                    raw_meta_json TEXT NOT NULL
+                );
+                ",
+            )
+            .expect("schema");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (1, '2026-06-03 10:00:00', 1, 72, 'healthy', NULL, NULL, 'real_usage', '精确', 0, ?1)",
+                [r#"{"payload":{"rate_limit":{"primary_window":{"limit_window_seconds":18000},"secondary_window":{"limit_window_seconds":604800}}}}"#],
+            )
+            .expect("real snapshot");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (1, '2026-06-03 10:05:00', 0, 0, 'healthy', NULL, NULL, 'real_usage', '精确', 0, ?1)",
+                [r#"{"payload":{"rate_limit":{"primary_window":{"limit_window_seconds":0,"used_percent":0},"secondary_window":null}}}"#],
+            )
+            .expect("incomplete zero snapshot");
+
+        let snapshot = query_latest_real_usage_snapshot(&connection, 1)
+            .expect("query")
+            .expect("snapshot");
+        assert_eq!(snapshot.window_5h_percent, 1);
+        assert_eq!(snapshot.window_7d_percent, 72);
     }
 }
