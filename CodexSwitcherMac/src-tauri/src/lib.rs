@@ -43,7 +43,7 @@ use switching::{
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{TrayIconBuilder, TrayIconEvent},
-    Manager, State, WebviewWindow, WindowEvent,
+    Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 use usage::{
     insert_real_usage_snapshot, query_latest_real_usage_snapshot, query_latest_snapshot,
@@ -1425,22 +1425,6 @@ fn cleanup_legacy_demo_data(connection: &Connection) -> Result<(), String> {
 
     connection
         .execute(
-            "DELETE FROM usage_snapshots
-             WHERE source_type = 'real_usage'
-               AND is_estimated = 0
-               AND window_5h_percent = 0
-               AND window_7d_percent = 0
-               AND (
-                   COALESCE(json_extract(raw_meta_json, '$.payload.rate_limit.primary_window.limit_window_seconds'), 0) <= 0
-                   OR json_type(raw_meta_json, '$.payload.rate_limit.secondary_window') IS NULL
-                   OR json_type(raw_meta_json, '$.payload.rate_limit.secondary_window') = 'null'
-               )",
-            [],
-        )
-        .map_err(|error| error.to_string())?;
-
-    connection
-        .execute(
             "DELETE FROM notifications WHERE source_type = 'mock_estimator'",
             [],
         )
@@ -1633,6 +1617,35 @@ fn collect_bound_snapshot_sampling_outcome(
     }
 }
 
+fn reading_regresses_before_reset(
+    latest: &UsageSnapshot,
+    reading: &RealUsageReading,
+    now: chrono::DateTime<Local>,
+) -> bool {
+    const FIVE_H_REGRESSION_TOLERANCE: i64 = 2;
+    const SEVEN_D_REGRESSION_TOLERANCE: i64 = 1;
+
+    let five_h_not_reset = latest
+        .estimated_reset_5h_at
+        .as_deref()
+        .and_then(parse_local_datetime_text)
+        .map(|reset_at| now < reset_at)
+        .unwrap_or(false);
+    let seven_d_not_reset = latest
+        .estimated_reset_7d_at
+        .as_deref()
+        .and_then(parse_local_datetime_text)
+        .map(|reset_at| now < reset_at)
+        .unwrap_or(false);
+
+    let five_h_regressed = five_h_not_reset
+        && reading.window_5h_percent + FIVE_H_REGRESSION_TOLERANCE < latest.window_5h_percent;
+    let seven_d_regressed = seven_d_not_reset
+        && reading.window_7d_percent + SEVEN_D_REGRESSION_TOLERANCE < latest.window_7d_percent;
+
+    five_h_regressed || seven_d_regressed
+}
+
 fn apply_background_sampling_outcome(
     connection: &Connection,
     account: &Account,
@@ -1645,6 +1658,22 @@ fn apply_background_sampling_outcome(
 
     match outcome {
         RealAccountSamplingOutcome::Updated(reading) => {
+            if let Some(latest) = query_latest_real_usage_snapshot(connection, account.id)? {
+                if reading_regresses_before_reset(&latest, &reading, now) {
+                    connection
+                        .execute(
+                            "UPDATE accounts SET status = ?1, auth_state = 'valid', last_verified_at = ?2, last_check_time = ?2, estimated_reset_time = ?3, updated_at = ?2 WHERE id = ?4",
+                            params![
+                                latest.risk_level,
+                                now_text,
+                                latest.estimated_reset_5h_at,
+                                account.id,
+                            ],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+            }
             insert_real_usage_snapshot(connection, account.id, now, &reading)?;
         }
         RealAccountSamplingOutcome::Unavailable => {
@@ -7528,14 +7557,28 @@ fn update_settings(
 
 #[tauri::command]
 fn open_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "主窗口不存在".to_string())?;
+    let window = ensure_main_window(&app)?;
     show_window(&window)?;
     Ok(())
 }
 
+fn ensure_main_window(app: &tauri::AppHandle) -> Result<WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window("main") {
+        return Ok(window);
+    }
+
+    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        .title("CodexSwitcher Mac")
+        .inner_size(1440.0, 960.0)
+        .min_inner_size(1200.0, 760.0)
+        .resizable(true)
+        .visible(true)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
 fn show_window(window: &WebviewWindow) -> Result<(), String> {
+    let _ = window.unminimize();
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())?;
     Ok(())
@@ -10486,17 +10529,6 @@ mod tests {
                 params![now_text()],
             )
             .expect("insert mock snapshot");
-        connection
-            .execute(
-                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
-                 VALUES (1, ?1, 0, 0, 'healthy', NULL, NULL, 'real_usage', '精确', 0, ?2)",
-                params![
-                    now_text(),
-                    r#"{"payload":{"rate_limit":{"primary_window":{"limit_window_seconds":0,"used_percent":0},"secondary_window":null}}}"#,
-                ],
-            )
-            .expect("insert incomplete zero snapshot");
-
         cleanup_legacy_demo_data(&connection).expect("cleanup legacy demo data");
 
         let manual_count: i64 = connection
@@ -10505,21 +10537,9 @@ mod tests {
         let mock_snapshot_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM usage_snapshots WHERE source_type != 'real_usage' OR is_estimated = 1", [], |row| row.get(0))
             .expect("count mock snapshots");
-        let incomplete_zero_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM usage_snapshots
-                 WHERE source_type = 'real_usage'
-                   AND window_5h_percent = 0
-                   AND window_7d_percent = 0
-                   AND json_type(raw_meta_json, '$.payload.rate_limit.secondary_window') = 'null'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count incomplete zero snapshots");
 
         assert_eq!(manual_count, 0);
         assert_eq!(mock_snapshot_count, 0);
-        assert_eq!(incomplete_zero_count, 0);
     }
 
     #[test]
@@ -10865,6 +10885,61 @@ mod tests {
     }
 
     #[test]
+    fn sampling_ignores_usage_regression_before_reset() {
+        let connection = setup_test_connection();
+        connection
+            .execute("DELETE FROM usage_snapshots WHERE account_id = 1", [])
+            .expect("clear snapshots");
+        connection
+            .execute(
+                "UPDATE accounts SET is_real_session = 1, binding_kind = 'codex_cli', auth_state = 'valid', status = 'healthy', updated_at = ?1 WHERE id = 1",
+                params![now_text()],
+            )
+            .expect("mark account real");
+
+        let now = Local::now();
+        let reset_5h = (now + Duration::hours(4))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let reset_7d = (now + Duration::days(4))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (1, ?1, 9, 21, 'healthy', ?2, ?3, 'real_usage', '精确', 0, '{\"kind\":\"stable\"}')",
+                params![now_text(), reset_5h, reset_7d],
+            )
+            .expect("insert stable snapshot");
+        let account = query_account_by_id(&connection, 1).expect("real account");
+        let mut created_notifications = 0;
+
+        apply_background_sampling_outcome(
+            &connection,
+            &account,
+            now,
+            RealAccountSamplingOutcome::Updated(RealUsageReading {
+                window_5h_percent: 1,
+                window_7d_percent: 20,
+                confidence_label: "精确".to_string(),
+                estimated_reset_5h_at: Some((now + Duration::hours(5)).format("%Y-%m-%d %H:%M:%S").to_string()),
+                estimated_reset_7d_at: Some(reset_7d),
+                raw_meta_json: "{\"kind\":\"regression\"}".to_string(),
+            }),
+            &mut created_notifications,
+            3,
+        )
+        .expect("apply regression sampling outcome");
+
+        let latest = query_latest_real_usage_snapshot(&connection, 1)
+            .expect("query latest")
+            .expect("latest snapshot");
+        assert_eq!(latest.window_5h_percent, 9);
+        assert_eq!(latest.window_7d_percent, 21);
+        assert_eq!(created_notifications, 0);
+    }
+
+    #[test]
     fn query_accounts_recovers_inactive_auth_invalid_when_bound_snapshot_is_trusted() {
         let connection = setup_test_connection();
         let snapshot_path = unique_temp_file("inactive-trusted-snapshot.json");
@@ -10999,6 +11074,18 @@ pub fn run() {
             });
             setup_tray(app)?;
             setup_background_sampler(app);
+            let app_handle = app.handle().clone();
+            thread::spawn(move || {
+                thread::sleep(StdDuration::from_millis(500));
+                match ensure_main_window(&app_handle) {
+                    Ok(window) => {
+                        if let Err(error) = show_window(&window) {
+                            eprintln!("CodexSwitcherMac show window failed: {}", error);
+                        }
+                    }
+                    Err(error) => eprintln!("CodexSwitcherMac ensure window failed: {}", error),
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
