@@ -31,10 +31,10 @@ impl AccountStatus {
         }
     }
 
-    fn from_percent(percent: i64) -> Self {
-        if percent >= 100 {
+    fn from_remaining_percent(percent: i64) -> Self {
+        if percent <= 0 {
             Self::Exhausted
-        } else if percent >= 85 {
+        } else if percent <= 15 {
             Self::Warning
         } else {
             Self::Healthy
@@ -125,7 +125,7 @@ pub(crate) fn usage_risk_from_windows(
     window_5h_percent: i64,
     window_7d_percent: i64,
 ) -> AccountStatus {
-    AccountStatus::from_percent(window_5h_percent.max(window_7d_percent))
+    AccountStatus::from_remaining_percent(window_5h_percent.min(window_7d_percent))
 }
 
 fn parse_real_usage_read_state(credentials_json: &str) -> Result<RealUsageReadState, String> {
@@ -146,6 +146,10 @@ fn parse_real_usage_read_state(credentials_json: &str) -> Result<RealUsageReadSt
 
 fn required_percent(value: Option<f64>) -> Option<i64> {
     value.map(|percent| percent.round().clamp(0.0, 100.0) as i64)
+}
+
+fn remaining_percent_from_used(value: Option<f64>) -> Option<i64> {
+    required_percent(value).map(|used_percent| (100 - used_percent).clamp(0, 100))
 }
 
 fn has_valid_window_duration(window: &WhamUsageWindow) -> bool {
@@ -367,7 +371,7 @@ pub(crate) fn read_real_usage_from_credentials(
         return Ok(None);
     }
 
-    let Some(window_5h_percent) = required_percent(primary.used_percent) else {
+    let Some(window_5h_percent) = remaining_percent_from_used(primary.used_percent) else {
         return Ok(None);
     };
     let Some(secondary) = rate_limit.secondary_window else {
@@ -376,7 +380,7 @@ pub(crate) fn read_real_usage_from_credentials(
     if !has_valid_window_duration(&secondary) {
         return Ok(None);
     }
-    let Some(window_7d_percent) = required_percent(secondary.used_percent) else {
+    let Some(window_7d_percent) = remaining_percent_from_used(secondary.used_percent) else {
         return Ok(None);
     };
     let estimated_reset_7d_at = unix_seconds_to_local_text(secondary.reset_at);
@@ -519,7 +523,10 @@ fn is_incomplete_zero_usage_snapshot(snapshot: &UsageSnapshot, raw_meta_json: &s
     let Ok(meta) = serde_json::from_str::<Value>(raw_meta_json) else {
         return false;
     };
-    let Some(rate_limit) = meta.get("payload").and_then(|payload| payload.get("rate_limit")) else {
+    let Some(rate_limit) = meta
+        .get("payload")
+        .and_then(|payload| payload.get("rate_limit"))
+    else {
         return false;
     };
     let primary_duration = rate_limit
@@ -628,6 +635,14 @@ mod tests {
         assert_eq!(required_percent(Some(12.4)), Some(12));
         assert_eq!(required_percent(Some(150.0)), Some(100));
         assert_eq!(required_percent(None), None);
+    }
+
+    #[test]
+    fn remaining_percent_matches_codex_usage_menu() {
+        assert_eq!(remaining_percent_from_used(Some(73.0)), Some(27));
+        assert_eq!(remaining_percent_from_used(Some(78.0)), Some(22));
+        assert_eq!(remaining_percent_from_used(Some(150.0)), Some(0));
+        assert_eq!(remaining_percent_from_used(None), None);
     }
 
     #[test]

@@ -46,8 +46,8 @@ export function IdentityAssetTable({
     <div className={`identity-asset-table ${renderActions ? "identity-asset-table--tool" : ""}`}>
       <div className="identity-asset-table__header">
         <span>身份</span>
-        <span>5h</span>
-        <span>7d</span>
+        <span>5h 剩余</span>
+        <span>7d 剩余</span>
         <span>5h 恢复</span>
         <span>7d 恢复</span>
         <span>状态</span>
@@ -116,4 +116,3 @@ export function IdentityAssetTable({
 }
 
 export type { IdentityAssetTableProps };
-

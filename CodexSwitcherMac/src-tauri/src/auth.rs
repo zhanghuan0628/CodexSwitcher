@@ -79,7 +79,10 @@ fn command_with_gui_env(program: &Path) -> Command {
 }
 
 fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
     let started_at = Instant::now();
 
     loop {

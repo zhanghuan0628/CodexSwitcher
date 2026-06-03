@@ -43,7 +43,7 @@ use switching::{
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{TrayIconBuilder, TrayIconEvent},
-    Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    Manager, RunEvent, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 use usage::{
     insert_real_usage_snapshot, query_latest_real_usage_snapshot, query_latest_snapshot,
@@ -561,11 +561,22 @@ fn read_real_usage_from_live_session(
     account: &Account,
     snapshot: &SessionSnapshot,
 ) -> Result<Option<RealUsageReading>, RealUsageReadError> {
-    read_real_usage_from_credentials(
-        account.id,
-        account.profile_ref.as_deref(),
-        &snapshot.credentials_json,
-    )
+    read_real_usage_from_session_with_profile(account, snapshot, account.profile_ref.as_deref())
+}
+
+fn read_real_usage_from_active_live_session(
+    account: &Account,
+    snapshot: &SessionSnapshot,
+) -> Result<Option<RealUsageReading>, RealUsageReadError> {
+    read_real_usage_from_session_with_profile(account, snapshot, None)
+}
+
+fn read_real_usage_from_session_with_profile(
+    account: &Account,
+    snapshot: &SessionSnapshot,
+    profile_ref: Option<&str>,
+) -> Result<Option<RealUsageReading>, RealUsageReadError> {
+    read_real_usage_from_credentials(account.id, profile_ref, &snapshot.credentials_json)
 }
 
 fn mark_account_auth_invalid(
@@ -1180,15 +1191,72 @@ fn init_database(connection: &Connection) -> Result<(), String> {
                 launch_at_login INTEGER NOT NULL,
                 menu_bar_only INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
             ",
         )
         .map_err(|error| error.to_string())?;
 
     migrate_accounts_schema(connection)?;
     seed_defaults(connection)?;
+    migrate_real_usage_snapshots_to_remaining_percent(connection)?;
     cleanup_legacy_demo_data(connection)?;
     purge_legacy_handoff_cards(connection)?;
     sync_account_credential_profiles(connection)?;
+    Ok(())
+}
+
+fn migrate_real_usage_snapshots_to_remaining_percent(
+    connection: &Connection,
+) -> Result<(), String> {
+    let already_applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE name = 'real_usage_remaining_percent_v1'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .is_some();
+
+    if already_applied {
+        return Ok(());
+    }
+
+    connection
+        .execute(
+            "UPDATE usage_snapshots
+             SET window_5h_percent = MAX(0, MIN(100, 100 - CAST(json_extract(raw_meta_json, '$.payload.rate_limit.primary_window.used_percent') AS INTEGER))),
+                 window_7d_percent = MAX(0, MIN(100, 100 - CAST(json_extract(raw_meta_json, '$.payload.rate_limit.secondary_window.used_percent') AS INTEGER))),
+                 risk_level = CASE
+                     WHEN MIN(
+                         MAX(0, MIN(100, 100 - CAST(json_extract(raw_meta_json, '$.payload.rate_limit.primary_window.used_percent') AS INTEGER))),
+                         MAX(0, MIN(100, 100 - CAST(json_extract(raw_meta_json, '$.payload.rate_limit.secondary_window.used_percent') AS INTEGER)))
+                     ) <= 0 THEN 'exhausted'
+                     WHEN MIN(
+                         MAX(0, MIN(100, 100 - CAST(json_extract(raw_meta_json, '$.payload.rate_limit.primary_window.used_percent') AS INTEGER))),
+                         MAX(0, MIN(100, 100 - CAST(json_extract(raw_meta_json, '$.payload.rate_limit.secondary_window.used_percent') AS INTEGER)))
+                     ) <= 15 THEN 'warning'
+                     ELSE 'healthy'
+                 END
+             WHERE source_type = 'real_usage'
+               AND confidence_level = '精确'
+               AND is_estimated = 0
+               AND json_type(raw_meta_json, '$.payload.rate_limit.primary_window.used_percent') IN ('integer', 'real')
+               AND json_type(raw_meta_json, '$.payload.rate_limit.secondary_window.used_percent') IN ('integer', 'real')",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+
+    connection
+        .execute(
+            "INSERT INTO schema_migrations (name, applied_at) VALUES ('real_usage_remaining_percent_v1', ?1)",
+            [now_text()],
+        )
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1555,7 +1623,7 @@ fn collect_real_account_sampling_outcome(
     };
 
     if same_session {
-        return match read_real_usage_from_live_session(account, &live_snapshot) {
+        return match read_real_usage_from_active_live_session(account, &live_snapshot) {
             Ok(Some(reading)) => Ok(RealAccountSamplingOutcome::Updated(reading)),
             Ok(None) => Ok(RealAccountSamplingOutcome::Unavailable),
             Err(error) => {
@@ -1622,28 +1690,8 @@ fn reading_regresses_before_reset(
     reading: &RealUsageReading,
     now: chrono::DateTime<Local>,
 ) -> bool {
-    const FIVE_H_REGRESSION_TOLERANCE: i64 = 2;
-    const SEVEN_D_REGRESSION_TOLERANCE: i64 = 1;
-
-    let five_h_not_reset = latest
-        .estimated_reset_5h_at
-        .as_deref()
-        .and_then(parse_local_datetime_text)
-        .map(|reset_at| now < reset_at)
-        .unwrap_or(false);
-    let seven_d_not_reset = latest
-        .estimated_reset_7d_at
-        .as_deref()
-        .and_then(parse_local_datetime_text)
-        .map(|reset_at| now < reset_at)
-        .unwrap_or(false);
-
-    let five_h_regressed = five_h_not_reset
-        && reading.window_5h_percent + FIVE_H_REGRESSION_TOLERANCE < latest.window_5h_percent;
-    let seven_d_regressed = seven_d_not_reset
-        && reading.window_7d_percent + SEVEN_D_REGRESSION_TOLERANCE < latest.window_7d_percent;
-
-    five_h_regressed || seven_d_regressed
+    let _ = (latest, reading, now);
+    false
 }
 
 fn apply_background_sampling_outcome(
@@ -1778,7 +1826,7 @@ fn sample_real_account_usage(
     };
 
     if same_session {
-        match read_real_usage_from_live_session(account, &live_snapshot) {
+        match read_real_usage_from_active_live_session(account, &live_snapshot) {
             Ok(Some(reading)) => {
                 insert_real_usage_snapshot(connection, account.id, now, &reading)?;
                 return Ok(true);
@@ -2148,7 +2196,10 @@ fn delete_profile_secret_ref(secret_ref: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn delete_credential_profile_record(connection: &Connection, profile_id: i64) -> Result<(), String> {
+fn delete_credential_profile_record(
+    connection: &Connection,
+    profile_id: i64,
+) -> Result<(), String> {
     let profile = query_credential_profile_by_id(connection, profile_id)?;
     if profile.profile_kind != "third_party_key" {
         return Err("官方账号资产不能删除。".to_string());
@@ -2917,10 +2968,7 @@ fn recover_inactive_accounts_with_trusted_snapshot(connection: &Connection) -> R
     Ok(())
 }
 
-fn exhausted_snapshot_reset_due_at(
-    snapshot: &UsageSnapshot,
-    now: chrono::DateTime<Local>,
-) -> bool {
+fn exhausted_snapshot_reset_due_at(snapshot: &UsageSnapshot, now: chrono::DateTime<Local>) -> bool {
     if snapshot.risk_level != "exhausted" {
         return false;
     }
@@ -4991,7 +5039,7 @@ fn account_health_timeline(snapshots: &[UsageSnapshot]) -> Vec<TimelineSegment> 
             hours: 1,
             label: snapshot.sample_time.clone(),
             tooltip: format!(
-                "5h 已用 {}%，7d 已用 {}%，可信度 {}",
+                "5h 剩余 {}%，7d 剩余 {}%，可信度 {}",
                 snapshot.window_5h_percent, snapshot.window_7d_percent, snapshot.confidence_level
             ),
         })
@@ -5291,7 +5339,7 @@ fn build_usage_display_state(
                     source_type: snapshot.source_type.clone(),
                     confidence_label: snapshot.confidence_level.clone(),
                     summary: format!(
-                        "5h 已用 {}% · 7d 已用 {}% · 5h 恢复 {} · 7d 恢复 {} · {}",
+                        "5h 剩余 {}% · 7d 剩余 {}% · 5h 恢复 {} · 7d 恢复 {} · {}",
                         snapshot.window_5h_percent,
                         snapshot.window_7d_percent,
                         snapshot.estimated_reset_5h_at.as_deref().unwrap_or("未知"),
@@ -5502,7 +5550,7 @@ fn build_chart_points(connection: &Connection) -> Result<Vec<ChartPoint>, String
                     .position(|account| account.id == item.account_id)
                     .unwrap_or(usize::MAX)
             });
-            let event_label = if series.iter().any(|item| item.value >= 85) {
+            let event_label = if series.iter().any(|item| item.value <= 15) {
                 Some("预警".to_string())
             } else {
                 None
@@ -5583,9 +5631,10 @@ fn compare_optional_reset(
 }
 
 fn compare_candidates(left: &RecommendationCandidate, right: &RecommendationCandidate) -> Ordering {
-    left.max_percent
-        .cmp(&right.max_percent)
-        .then(left.total_percent.cmp(&right.total_percent))
+    right
+        .max_percent
+        .cmp(&left.max_percent)
+        .then(right.total_percent.cmp(&left.total_percent))
         .then(compare_optional_reset(
             left.earliest_reset_at,
             right.earliest_reset_at,
@@ -5608,15 +5657,15 @@ fn recommended_switch_candidate(
             continue;
         };
 
-        let max_percent = snapshot.window_5h_percent.max(snapshot.window_7d_percent);
+        let max_percent = snapshot.window_5h_percent.min(snapshot.window_7d_percent);
         let total_percent = snapshot.window_5h_percent + snapshot.window_7d_percent;
-        let risk_window = if snapshot.window_5h_percent >= snapshot.window_7d_percent {
+        let risk_window = if snapshot.window_5h_percent <= snapshot.window_7d_percent {
             "5h"
         } else {
             "7d"
         };
         let reason = format!(
-            "{} 当前 5h 已用 {}%，7d 已用 {}%，优先风险来自 {} 窗口。",
+            "{} 当前 5h 剩余 {}%，7d 剩余 {}%，优先风险来自 {} 窗口。",
             account.nickname, snapshot.window_5h_percent, snapshot.window_7d_percent, risk_window
         );
 
@@ -5721,14 +5770,14 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                 };
             };
 
-            let dominant_is_five = snapshot.window_5h_percent >= snapshot.window_7d_percent;
+            let dominant_is_five = snapshot.window_5h_percent <= snapshot.window_7d_percent;
             let dominant_label = if dominant_is_five { "5h" } else { "7d" };
-            let dominant_percent = snapshot.window_5h_percent.max(snapshot.window_7d_percent);
+            let dominant_percent = snapshot.window_5h_percent.min(snapshot.window_7d_percent);
             let reset_5h = snapshot.estimated_reset_5h_at.as_deref().unwrap_or("未知");
             let reset_7d = snapshot.estimated_reset_7d_at.as_deref().unwrap_or("未知");
             let recommended_now = recommended_account_id == Some(account.id);
 
-            let (next_action, segments) = if dominant_percent >= 100 {
+            let (next_action, segments) = if dominant_percent <= 0 {
                 (
                     format!("等待 {} 窗口恢复后再参与切换。", dominant_label),
                     vec![
@@ -5737,7 +5786,7 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                             4,
                             "等待恢复",
                             format!(
-                                "5h {}%，7d {}%；5h 恢复 {}；7d 恢复 {}",
+                                "5h 剩余 {}%，7d 剩余 {}%；5h 恢复 {}；7d 恢复 {}",
                                 snapshot.window_5h_percent,
                                 snapshot.window_7d_percent,
                                 reset_5h,
@@ -5758,7 +5807,7 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                         ),
                     ],
                 )
-            } else if dominant_percent >= 85 {
+            } else if dominant_percent <= 15 {
                 (
                     format!("处于预警区，优先观察 {} 窗口并准备接力。", dominant_label),
                     vec![
@@ -5767,7 +5816,7 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                             4,
                             "预警观察",
                             format!(
-                                "5h {}%，7d {}%；主风险来自 {} 窗口。",
+                                "5h 剩余 {}%，7d 剩余 {}%；主风险来自 {} 窗口。",
                                 snapshot.window_5h_percent,
                                 snapshot.window_7d_percent,
                                 dominant_label
@@ -5807,7 +5856,7 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                                 "当前可用"
                             },
                             format!(
-                                "5h {}%，7d {}%；5h 恢复 {}；7d 恢复 {}",
+                                "5h 剩余 {}%，7d 剩余 {}%；5h 恢复 {}；7d 恢复 {}",
                                 snapshot.window_5h_percent,
                                 snapshot.window_7d_percent,
                                 reset_5h,
@@ -5815,13 +5864,13 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                             ),
                         ),
                         timeline_segment(
-                            if dominant_percent >= 70 {
+                            if dominant_percent <= 30 {
                                 "warning"
                             } else {
                                 "healthy"
                             },
                             4,
-                            if dominant_percent >= 70 {
+                            if dominant_percent <= 30 {
                                 "预警观察"
                             } else {
                                 "继续可用"
@@ -5829,7 +5878,7 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                             format!("主风险来自 {} 窗口。", dominant_label),
                         ),
                         timeline_segment(
-                            if dominant_percent >= 70 {
+                            if dominant_percent <= 30 {
                                 "warning"
                             } else {
                                 "healthy"
@@ -5891,23 +5940,25 @@ fn build_recommendations(
                 );
             }
         } else if let Some(snapshot) = latest_snapshot {
-            let highest_window = snapshot.window_5h_percent.max(snapshot.window_7d_percent);
-            if highest_window >= 100 {
+            let lowest_remaining = snapshot.window_5h_percent.min(snapshot.window_7d_percent);
+            let high_remaining_warning = (100 - settings.warn_threshold_high).max(0);
+            let mid_remaining_warning = (100 - settings.warn_threshold_mid).max(0);
+            if lowest_remaining <= 0 {
                 if let Some(candidate) = accounts
                     .iter()
                     .find(|account| Some(account.id) == recommended_account_id)
                 {
                     recommendations.push(format!(
-                        "推荐立即切换到 {}，当前活跃账号已有额度窗口达到 100%。",
+                        "推荐立即切换到 {}，当前活跃账号已有额度窗口剩余为 0%。",
                         candidate.nickname
                     ));
                 } else {
                     recommendations.push(
-                        "当前账号额度窗口已满，且没有健康备用账号，建议先走官方扩容或等待恢复。"
+                        "当前账号额度窗口剩余为 0%，且没有健康备用账号，建议先走官方扩容或等待恢复。"
                             .to_string(),
                     );
                 }
-            } else if highest_window >= settings.warn_threshold_high {
+            } else if lowest_remaining <= high_remaining_warning {
                 if let Some(candidate) = accounts
                     .iter()
                     .find(|account| Some(account.id) == recommended_account_id)
@@ -5920,7 +5971,7 @@ fn build_recommendations(
                     recommendations
                         .push("当前没有健康备用账号，建议先走官方扩容或修复授权。".to_string());
                 }
-            } else if highest_window >= settings.warn_threshold_mid {
+            } else if lowest_remaining <= mid_remaining_warning {
                 if let Some(candidate) = accounts
                     .iter()
                     .find(|account| Some(account.id) == recommended_account_id)
@@ -6007,10 +6058,7 @@ fn sample_accounts_with_notifications(
 #[cfg(test)]
 #[allow(dead_code)]
 fn generate_usage_snapshots(connection: &Connection) -> Result<(), String> {
-    let accounts = query_accounts(connection)?
-        .into_iter()
-        .filter(|account| account.is_real_session)
-        .collect::<Vec<_>>();
+    let accounts = automatic_sampling_accounts(&query_accounts(connection)?, Local::now());
     sample_accounts_with_notifications(connection, &accounts, 3)
 }
 
@@ -6066,6 +6114,48 @@ fn active_sampling_accounts(accounts: &[Account]) -> Vec<Account> {
         .collect()
 }
 
+fn snapshot_reset_due(snapshot: &UsageSnapshot, now: chrono::DateTime<Local>) -> bool {
+    let sample_time = parse_local_datetime_text(&snapshot.sample_time);
+    [
+        snapshot.estimated_reset_5h_at.as_deref(),
+        snapshot.estimated_reset_7d_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(parse_local_datetime_text)
+    .any(|reset_at| {
+        if let Some(sample_time) = sample_time {
+            sample_time < reset_at && reset_at <= now
+        } else {
+            reset_at <= now
+        }
+    })
+}
+
+fn should_auto_sample_account(account: &Account, now: chrono::DateTime<Local>) -> bool {
+    if !account.is_real_session {
+        return false;
+    }
+
+    if account.is_active {
+        return true;
+    }
+
+    account
+        .latest_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot_reset_due(snapshot, now))
+        .unwrap_or(true)
+}
+
+fn automatic_sampling_accounts(accounts: &[Account], now: chrono::DateTime<Local>) -> Vec<Account> {
+    accounts
+        .iter()
+        .filter(|account| should_auto_sample_account(account, now))
+        .cloned()
+        .collect()
+}
+
 fn sample_accounts_without_long_db_lock(
     state: &AppState,
     accounts: &[Account],
@@ -6110,10 +6200,7 @@ fn generate_usage_snapshots_for_state(state: &AppState) -> Result<(), String> {
             .db
             .lock()
             .map_err(|_| "数据库锁获取失败".to_string())?;
-        query_accounts(&connection)?
-            .into_iter()
-            .filter(|account| account.is_real_session)
-            .collect::<Vec<_>>()
+        automatic_sampling_accounts(&query_accounts(&connection)?, Local::now())
     };
 
     sample_accounts_without_long_db_lock(state, &accounts, 3)
@@ -6806,7 +6893,10 @@ fn get_account_detail(id: i64, state: State<'_, AppState>) -> Result<AccountDeta
     build_account_detail(&connection, id)
 }
 
-fn current_login_matches_account(current_login: Option<&CurrentCodexLogin>, account: &Account) -> bool {
+fn current_login_matches_account(
+    current_login: Option<&CurrentCodexLogin>,
+    account: &Account,
+) -> bool {
     let Some(current_login) = current_login else {
         return false;
     };
@@ -7730,10 +7820,7 @@ fn run_background_sampling_pass(
             .db
             .lock()
             .map_err(|_| "数据库锁获取失败".to_string())?;
-        query_accounts(&connection)?
-            .into_iter()
-            .filter(|account| account.is_real_session)
-            .collect::<Vec<_>>()
+        automatic_sampling_accounts(&query_accounts(&connection)?, Local::now())
     };
 
     let mut created_notifications = 0;
@@ -7990,7 +8077,7 @@ fn current_tray_presentation(connection: &Connection) -> TrayPresentation {
                         )
                     };
                     let tooltip = format!(
-                        "{}｜状态 {}｜5h {}%｜7d {}%｜5h恢复 {}｜7d恢复 {}",
+                        "{}｜状态 {}｜5h剩余 {}%｜7d剩余 {}%｜5h恢复 {}｜7d恢复 {}",
                         active.nickname,
                         tray_status_text(&active.status),
                         snapshot.window_5h_percent,
@@ -7999,7 +8086,7 @@ fn current_tray_presentation(connection: &Connection) -> TrayPresentation {
                         snapshot.estimated_reset_7d_at.as_deref().unwrap_or("未知"),
                     );
                     let detail = format!(
-                        "当前：{} · 状态 {} · 5h {}% · 7d {}%",
+                        "当前：{} · 状态 {} · 5h剩余 {}% · 7d剩余 {}%",
                         active.nickname,
                         tray_status_text(&active.status),
                         snapshot.window_5h_percent,
@@ -8127,14 +8214,14 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
         )
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { .. } = event {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
+                if let Ok(window) = ensure_main_window(tray.app_handle()) {
                     let _ = show_window(&window);
                 }
             }
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Ok(window) = ensure_main_window(app) {
                     let _ = show_window(&window);
                 }
             }
@@ -8156,13 +8243,13 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
                 }
             }
             "settings" => {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Ok(window) = ensure_main_window(app) {
                     let _ = show_window(&window);
                     let _ = window.eval("window.location.hash = '#settings'");
                 }
             }
             "project_sessions" => {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Ok(window) = ensure_main_window(app) {
                     let _ = show_window(&window);
                     let _ = window.eval("window.location.hash = '#handoff'");
                 }
@@ -9007,7 +9094,9 @@ mod tests {
         delete_account_record(&connection, 2, None).expect("delete inactive official account");
 
         let account_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM accounts WHERE id = 2", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM accounts WHERE id = 2", [], |row| {
+                row.get(0)
+            })
             .expect("count deleted account");
         assert_eq!(account_count, 0);
 
@@ -9172,13 +9261,17 @@ mod tests {
     }
 
     #[test]
-    fn usage_risk_uses_highest_window_percent() {
+    fn usage_risk_uses_lowest_remaining_percent() {
         assert_eq!(
             usage_risk_from_windows(0, 100).as_str(),
             AccountStatus::Exhausted.as_str()
         );
         assert_eq!(
-            usage_risk_from_windows(86, 45).as_str(),
+            usage_risk_from_windows(16, 45).as_str(),
+            AccountStatus::Healthy.as_str()
+        );
+        assert_eq!(
+            usage_risk_from_windows(15, 45).as_str(),
             AccountStatus::Warning.as_str()
         );
         assert_eq!(
@@ -10885,7 +10978,7 @@ mod tests {
     }
 
     #[test]
-    fn sampling_ignores_usage_regression_before_reset() {
+    fn sampling_records_remaining_decrease_before_reset() {
         let connection = setup_test_connection();
         connection
             .execute("DELETE FROM usage_snapshots WHERE account_id = 1", [])
@@ -10922,20 +11015,83 @@ mod tests {
                 window_5h_percent: 1,
                 window_7d_percent: 20,
                 confidence_label: "精确".to_string(),
-                estimated_reset_5h_at: Some((now + Duration::hours(5)).format("%Y-%m-%d %H:%M:%S").to_string()),
+                estimated_reset_5h_at: Some(
+                    (now + Duration::hours(5))
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                ),
                 estimated_reset_7d_at: Some(reset_7d),
                 raw_meta_json: "{\"kind\":\"regression\"}".to_string(),
             }),
             &mut created_notifications,
             3,
         )
-        .expect("apply regression sampling outcome");
+        .expect("apply lower remaining sampling outcome");
 
         let latest = query_latest_real_usage_snapshot(&connection, 1)
             .expect("query latest")
             .expect("latest snapshot");
-        assert_eq!(latest.window_5h_percent, 9);
-        assert_eq!(latest.window_7d_percent, 21);
+        assert_eq!(latest.window_5h_percent, 1);
+        assert_eq!(latest.window_7d_percent, 20);
+        assert_eq!(created_notifications, 0);
+    }
+
+    #[test]
+    fn sampling_accepts_cross_window_change_after_account_switch() {
+        let connection = setup_test_connection();
+        connection
+            .execute("DELETE FROM usage_snapshots WHERE account_id = 1", [])
+            .expect("clear snapshots");
+        connection
+            .execute(
+                "UPDATE accounts SET is_real_session = 1, binding_kind = 'codex_cli', auth_state = 'valid', status = 'healthy', updated_at = ?1 WHERE id = 1",
+                params![now_text()],
+            )
+            .expect("mark account real");
+
+        let now = Local::now();
+        let reset_5h = (now + Duration::hours(4))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let reset_7d = (now + Duration::days(4))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (1, ?1, 1, 72, 'healthy', ?2, ?3, 'real_usage', '精确', 0, '{\"kind\":\"old-context\"}')",
+                params![now_text(), reset_5h, reset_7d],
+            )
+            .expect("insert old context snapshot");
+        let account = query_account_by_id(&connection, 1).expect("real account");
+        let mut created_notifications = 0;
+
+        apply_background_sampling_outcome(
+            &connection,
+            &account,
+            now,
+            RealAccountSamplingOutcome::Updated(RealUsageReading {
+                window_5h_percent: 90,
+                window_7d_percent: 32,
+                confidence_label: "精确".to_string(),
+                estimated_reset_5h_at: Some(
+                    (now + Duration::hours(5))
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                ),
+                estimated_reset_7d_at: Some(reset_7d),
+                raw_meta_json: "{\"kind\":\"current-context\"}".to_string(),
+            }),
+            &mut created_notifications,
+            3,
+        )
+        .expect("apply cross-window sampling outcome");
+
+        let latest = query_latest_real_usage_snapshot(&connection, 1)
+            .expect("query latest")
+            .expect("latest snapshot");
+        assert_eq!(latest.window_5h_percent, 90);
+        assert_eq!(latest.window_7d_percent, 32);
         assert_eq!(created_notifications, 0);
     }
 
@@ -11054,6 +11210,67 @@ mod tests {
         drop(guard);
         assert!(try_begin_sampling_run(&state).is_some());
     }
+
+    #[test]
+    fn automatic_sampling_includes_inactive_account_when_reset_is_due() {
+        let connection = setup_test_connection();
+        let now = Local::now();
+        let sample_time = (now - Duration::hours(5))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let reset_due = (now - Duration::minutes(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let reset_future = (now + Duration::days(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        connection
+            .execute(
+                "UPDATE accounts SET is_real_session = 1, binding_kind = 'codex_cli', is_active = 0, auth_state = 'valid', status = 'warning', updated_at = ?1 WHERE id = 2",
+                params![now_text()],
+            )
+            .expect("mark inactive real account");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (2, ?1, 0, 63, 'exhausted', ?2, ?3, 'real_usage', '精确', 0, '{\"kind\":\"due\"}')",
+                params![sample_time, reset_due, reset_future],
+            )
+            .expect("insert due snapshot");
+
+        let accounts = query_accounts(&connection).expect("accounts");
+        let selected = automatic_sampling_accounts(&accounts, now);
+        assert!(selected.iter().any(|account| account.id == 2));
+    }
+
+    #[test]
+    fn automatic_sampling_skips_inactive_account_before_reset() {
+        let connection = setup_test_connection();
+        let now = Local::now();
+        let sample_time = (now - Duration::hours(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let reset_future = (now + Duration::hours(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        connection
+            .execute(
+                "UPDATE accounts SET is_real_session = 1, binding_kind = 'codex_cli', is_active = 0, auth_state = 'valid', status = 'warning', updated_at = ?1 WHERE id = 2",
+                params![now_text()],
+            )
+            .expect("mark inactive real account");
+        connection
+            .execute(
+                "INSERT INTO usage_snapshots (account_id, sample_time, window_5h_percent, window_7d_percent, risk_level, estimated_reset_5h_at, estimated_reset_7d_at, source_type, confidence_level, is_estimated, raw_meta_json)
+                 VALUES (2, ?1, 0, 63, 'exhausted', ?2, ?2, 'real_usage', '精确', 0, '{\"kind\":\"not-due\"}')",
+                params![sample_time, reset_future],
+            )
+            .expect("insert not due snapshot");
+
+        let accounts = query_accounts(&connection).expect("accounts");
+        let selected = automatic_sampling_accounts(&accounts, now);
+        assert!(!selected.iter().any(|account| account.id == 2));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -11074,18 +11291,6 @@ pub fn run() {
             });
             setup_tray(app)?;
             setup_background_sampler(app);
-            let app_handle = app.handle().clone();
-            thread::spawn(move || {
-                thread::sleep(StdDuration::from_millis(500));
-                match ensure_main_window(&app_handle) {
-                    Ok(window) => {
-                        if let Err(error) = show_window(&window) {
-                            eprintln!("CodexSwitcherMac show window failed: {}", error);
-                        }
-                    }
-                    Err(error) => eprintln!("CodexSwitcherMac ensure window failed: {}", error),
-                }
-            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -11135,6 +11340,18 @@ pub fn run() {
             update_settings,
             open_main_window,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let RunEvent::Ready = event {
+                match ensure_main_window(app) {
+                    Ok(window) => {
+                        if let Err(error) = show_window(&window) {
+                            eprintln!("CodexSwitcherMac show window failed: {}", error);
+                        }
+                    }
+                    Err(error) => eprintln!("CodexSwitcherMac ensure window failed: {}", error),
+                }
+            }
+        });
 }

@@ -143,7 +143,7 @@ export function AccountDetailDrawer({
             <p>{accountDetail?.last_failure_reason ?? "暂无失败或预警记录"}</p>
             <p>最近检测：{account.last_check_time ?? "未检测"}</p>
             <p>最近校验：{account.last_verified_at ?? "未校验"}</p>
-            <p>最新用量：5h {accountUsagePercent(account, "window_5h_percent")} · 7d {accountUsagePercent(account, "window_7d_percent")}</p>
+            <p>最新剩余：5h {accountUsagePercent(account, "window_5h_percent")} · 7d {accountUsagePercent(account, "window_7d_percent")}</p>
           </article>
 
           <article className="binding-note account-detail-card">
@@ -173,7 +173,7 @@ export function AccountDetailDrawer({
               items={(accountDetail?.recent_snapshots ?? []).map((snapshot) => ({
                 id: `${snapshot.account_id}-${snapshot.sample_time}`,
                 title: snapshot.sample_time,
-                body: `5h ${snapshot.window_5h_percent}% · 7d ${snapshot.window_7d_percent}%`,
+                body: `5h 剩余 ${snapshot.window_5h_percent}% · 7d 剩余 ${snapshot.window_7d_percent}%`,
                 meta: statusLabel(snapshot.risk_level),
               }))}
               emptyTitle="暂无采样记录"

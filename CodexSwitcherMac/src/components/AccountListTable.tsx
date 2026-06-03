@@ -42,8 +42,8 @@ export function AccountListTable({
     <div className={`account-list-table ${renderActions ? "account-list-table--tool" : ""}`}>
       <div className="account-list-table__header">
         <span>账号</span>
-        <span>5h</span>
-        <span>7d</span>
+        <span>5h 剩余</span>
+        <span>7d 剩余</span>
         <span>5h 恢复</span>
         <span>7d 恢复</span>
         <span>状态</span>
