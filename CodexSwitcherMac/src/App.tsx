@@ -166,11 +166,19 @@ function App() {
     }
 
     void (async () => {
-      await refreshOverview({
-        includeSupportingData: false,
-        includeSelectedAccountDetail: false,
-        ignoreCooldown: false,
-      });
+      const activeKeyProfileId = activeIdentity?.kind === "third_party_key"
+        ? activeIdentity.profile.id
+        : null;
+      await Promise.all([
+        refreshOverview({
+          includeSupportingData: false,
+          includeSelectedAccountDetail: false,
+          ignoreCooldown: false,
+        }),
+        activeKeyProfileId === null
+          ? Promise.resolve()
+          : refreshKeyUsageForProfile(activeKeyProfileId),
+      ]);
     })();
   });
 
@@ -468,7 +476,7 @@ function App() {
           return [profile.id, await api.getKeyProfileUsage(profile.id)] as const;
         } catch (error) {
           void error;
-          return [profile.id, null] as const;
+          return [profile.id, undefined] as const;
         }
       }),
     );
@@ -483,13 +491,37 @@ function App() {
         if (profile.profile_kind !== "third_party_key") {
           return profile;
         }
+        const nextUsage = usageByProfileId.get(profile.id);
         return {
           ...profile,
-          usage_summary: usageByProfileId.has(profile.id)
-            ? usageByProfileId.get(profile.id) ?? null
+          usage_summary: nextUsage !== undefined
+            ? nextUsage
             : profile.usage_summary ?? null,
         };
       }));
+    });
+  }
+
+  async function refreshKeyUsageForProfile(profileId: number) {
+    const requestId = ++keyUsageRequestIdRef.current;
+    let usage: Awaited<ReturnType<typeof api.getKeyProfileUsage>>;
+    try {
+      usage = await api.getKeyProfileUsage(profileId);
+    } catch (error) {
+      void error;
+      return;
+    }
+
+    if (requestId !== keyUsageRequestIdRef.current) {
+      return;
+    }
+
+    startTransition(() => {
+      setCredentialProfiles((currentProfiles) => currentProfiles.map((profile) => (
+        profile.id === profileId && profile.profile_kind === "third_party_key"
+          ? { ...profile, usage_summary: usage ?? null }
+          : profile
+      )));
     });
   }
 
