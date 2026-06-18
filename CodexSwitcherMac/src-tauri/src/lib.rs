@@ -50,6 +50,7 @@ use usage::{
     read_real_usage_from_credentials, RealUsageReadError, RealUsageReadErrorKind, RealUsageReading,
     UsageSnapshot,
 };
+use uuid::Uuid;
 
 const TRAY_ID: &str = "codexswitcher-menu";
 const RECOVERY_REMINDER_MINUTES: i64 = 15;
@@ -3881,6 +3882,74 @@ fn sync_rollout_session_meta_model_provider(
     Ok(())
 }
 
+fn copy_rollout_for_imported_owner(
+    codex_dir: &Path,
+    session: &ParsedCodexLocalSession,
+    owner: &SessionOwner,
+    model_provider: &str,
+) -> Result<ParsedCodexLocalSession, String> {
+    let clone_key = format!(
+        "codexswitcher:{}:{}:{}",
+        session.session_id, owner.profile_kind, owner.profile_ref
+    );
+    let cloned_session_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, clone_key.as_bytes()).to_string();
+    let target_dir = codex_dir.join("sessions").join("codexswitcher-imported");
+    fs::create_dir_all(&target_dir)
+        .map_err(|error| format!("创建 Codex 导入会话目录失败：{}", error))?;
+    let target_path = target_dir.join(format!("rollout-{}.jsonl", cloned_session_id));
+
+    let source_path = Path::new(&session.source_path);
+    let content = fs::read_to_string(source_path)
+        .map_err(|error| format!("读取待复制 Codex rollout 失败：{}", error))?;
+    let had_trailing_newline = content.ends_with('\n');
+    let mut updated_meta = false;
+    let mut lines = Vec::new();
+
+    for line in content.lines() {
+        if updated_meta || line.trim().is_empty() {
+            lines.push(line.to_string());
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+            lines.push(line.to_string());
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            lines.push(line.to_string());
+            continue;
+        }
+        let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+            return Err("Codex rollout 的 session_meta 缺少 payload。".to_string());
+        };
+        payload.insert("id".to_string(), Value::String(cloned_session_id.clone()));
+        payload.insert(
+            "model_provider".to_string(),
+            Value::String(model_provider.to_string()),
+        );
+        lines.push(
+            serde_json::to_string(&value)
+                .map_err(|error| format!("生成 Codex 导入 rollout 失败：{}", error))?,
+        );
+        updated_meta = true;
+    }
+
+    if !updated_meta {
+        return Err("待复制的 Codex rollout 缺少 session_meta，无法安全创建独立会话。".to_string());
+    }
+    let mut copied_content = lines.join("\n");
+    if had_trailing_newline {
+        copied_content.push('\n');
+    }
+    fs::write(&target_path, copied_content)
+        .map_err(|error| format!("保存 Codex 导入 rollout 失败：{}", error))?;
+
+    let mut cloned = session.clone();
+    cloned.session_id = cloned_session_id;
+    cloned.source_path = target_path.to_string_lossy().to_string();
+    cloned.model_provider = model_provider.to_string();
+    Ok(cloned)
+}
+
 fn codex_thread_sandbox_policy(workspace_path: &str) -> String {
     json!({
         "type": "workspace-write",
@@ -4682,6 +4751,12 @@ fn candidate_identity_for_session(
     session: &ParsedCodexLocalSession,
     imported: Option<&(i64, String, String)>,
 ) -> Result<CodexCandidateIdentity, String> {
+    if session.source_path.contains("/codexswitcher-imported/") {
+        if let Some((_, profile_kind, profile_ref)) = imported {
+            return identity_from_owner_ref(connection, profile_kind, profile_ref);
+        }
+    }
+
     if !is_official_codex_model_provider(&session.model_provider) {
         if let Some(identity) = infer_custom_candidate_identity_from_source(
             connection,
@@ -4787,6 +4862,44 @@ fn list_codex_local_session_candidates_from_dir(
     Ok(candidates)
 }
 
+fn session_for_import_owner(
+    connection: &Connection,
+    codex_dir: &Path,
+    session: &ParsedCodexLocalSession,
+    owner: &SessionOwner,
+) -> Result<ParsedCodexLocalSession, String> {
+    if owner.profile_kind != "third_party_key" {
+        return Ok(session.clone());
+    }
+
+    let imported = imported_codex_session_owner(connection, &session.session_id)?;
+    let source_identity = candidate_identity_for_session(connection, session, imported.as_ref())?;
+    let target_provider = codex_model_provider_for_owner(connection, codex_dir, owner, false)
+        .unwrap_or_else(|| "custom".to_string());
+    let belongs_to_other_key = if source_identity.key.starts_with("key:") {
+        source_identity.key != owner.profile_ref
+    } else if source_identity.key.starts_with("codex_provider:") {
+        let matching_profiles = query_credential_profiles(connection)?
+            .into_iter()
+            .filter(|profile| {
+                profile.profile_kind == "third_party_key"
+                    && key_profile_model_provider(profile)
+                        .eq_ignore_ascii_case(session.model_provider.trim())
+            })
+            .collect::<Vec<_>>();
+        matching_profiles.len() == 1
+            && format!("key:{}", matching_profiles[0].id) != owner.profile_ref
+    } else {
+        false
+    };
+
+    if !belongs_to_other_key {
+        return Ok(session.clone());
+    }
+
+    copy_rollout_for_imported_owner(codex_dir, session, owner, &target_provider)
+}
+
 fn import_codex_local_session_candidates_from_dir(
     connection: &Connection,
     codex_dir: &Path,
@@ -4817,12 +4930,19 @@ fn import_codex_local_session_candidates_from_dir(
                 skipped_files += 1;
                 continue;
             }
-            if upsert_codex_imported_session(connection, &session, &owner, owner_pinned)? {
+            let imported_session =
+                session_for_import_owner(connection, codex_dir, &session, &owner)?;
+            if upsert_codex_imported_session(connection, &imported_session, &owner, owner_pinned)? {
                 imported_sessions += 1;
             } else {
                 updated_sessions += 1;
             }
-            if upsert_codex_state_thread_for_session(connection, codex_dir, &session, &owner)? {
+            if upsert_codex_state_thread_for_session(
+                connection,
+                codex_dir,
+                &imported_session,
+                &owner,
+            )? {
                 codex_synced_threads += 1;
             } else {
                 codex_skipped_threads += 1;
@@ -4877,12 +4997,24 @@ fn import_codex_local_session_candidates_from_dir(
                     skipped_files += 1;
                     continue;
                 }
-                if upsert_codex_imported_session(connection, &session, &owner, owner_pinned)? {
+                let imported_session =
+                    session_for_import_owner(connection, codex_dir, &session, &owner)?;
+                if upsert_codex_imported_session(
+                    connection,
+                    &imported_session,
+                    &owner,
+                    owner_pinned,
+                )? {
                     imported_sessions += 1;
                 } else {
                     updated_sessions += 1;
                 }
-                if upsert_codex_state_thread_for_session(connection, codex_dir, &session, &owner)? {
+                if upsert_codex_state_thread_for_session(
+                    connection,
+                    codex_dir,
+                    &imported_session,
+                    &owner,
+                )? {
                     codex_synced_threads += 1;
                 } else {
                     codex_skipped_threads += 1;
@@ -10161,7 +10293,7 @@ mod tests {
     }
 
     #[test]
-    fn importing_selected_candidate_reassigns_existing_owner_to_active_key() {
+    fn importing_selected_candidate_copies_existing_thread_to_active_key() {
         let connection = setup_test_connection();
         let yuchat_profile = create_key_profile_record(
             &connection,
@@ -10200,7 +10332,8 @@ mod tests {
             .expect("create sessions dir");
         fs::write(
             &rollout_path,
-            r#"{"timestamp":"2026-04-26T04:00:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello from reassigned thread"}]}}
+            r#"{"timestamp":"2026-04-26T04:00:00Z","type":"session_meta","payload":{"id":"reassign-thread","timestamp":"2026-04-26T04:00:00Z","cwd":"/Users/admin/IdeaProjects/CodexSwitcher","model_provider":"yuchat"}}
+{"timestamp":"2026-04-26T04:00:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello from reassigned thread"}]}}
 {"timestamp":"2026-04-26T04:00:15Z","type":"event_msg","payload":{"type":"error","message":"unexpected status 401 Unauthorized, url: https://sub2api.yuchat.top/v1/responses"}}
 "#,
         )
@@ -10261,10 +10394,21 @@ mod tests {
         )
         .expect("reimport selected candidate");
 
-        assert_eq!(result.imported_sessions, 0);
-        assert_eq!(result.updated_sessions, 1);
+        assert_eq!(result.imported_sessions, 1);
+        assert_eq!(result.updated_sessions, 0);
+        assert_eq!(result.codex_synced_threads, 1);
 
-        let owner_ref: String = connection
+        let repeated = import_codex_local_session_candidates_from_dir(
+            &connection,
+            &root,
+            &["reassign-thread".to_string()],
+            true,
+        )
+        .expect("repeat selected candidate import");
+        assert_eq!(repeated.imported_sessions, 0);
+        assert_eq!(repeated.updated_sessions, 1);
+
+        let original_owner_ref: String = connection
             .query_row(
                 "SELECT owner_profile_ref
                  FROM session_records
@@ -10272,17 +10416,72 @@ mod tests {
                 [],
                 |row| row.get(0),
             )
-            .expect("query updated owner");
-        assert_eq!(owner_ref, format!("key:{}", one_top_profile.id));
+            .expect("query original owner");
+        assert_eq!(original_owner_ref, format!("key:{}", yuchat_profile.id));
 
         let records = query_session_records(&connection).expect("query records after reimport");
-        let reassigned = records
-            .into_iter()
-            .find(|record| record.title == "待迁移线程")
-            .expect("find reassigned record");
         assert_eq!(
-            reassigned.owner_profile_ref,
+            records
+                .iter()
+                .filter(|record| record.title == "待迁移线程")
+                .count(),
+            2
+        );
+        let target_copy = records
+            .iter()
+            .find(|record| {
+                record.title == "待迁移线程"
+                    && record.owner_profile_ref == format!("key:{}", one_top_profile.id)
+            })
+            .expect("find copied record");
+        assert_eq!(
+            target_copy.owner_profile_ref,
             format!("key:{}", one_top_profile.id)
+        );
+
+        let copied_session_id: String = connection
+            .query_row(
+                "SELECT external_session_id FROM session_records WHERE id = ?1",
+                [target_copy.id],
+                |row| row.get(0),
+            )
+            .expect("copied external session id");
+        assert_ne!(copied_session_id, "reassign-thread");
+        let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
+        let original_provider: String = state
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'reassign-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query original provider");
+        let (copied_provider, copied_rollout): (String, String) = state
+            .query_row(
+                "SELECT model_provider, rollout_path FROM threads WHERE id = ?1",
+                [copied_session_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query copied thread");
+        assert_eq!(original_provider, "custom");
+        assert_eq!(copied_provider, "oneTop");
+        assert_ne!(copied_rollout, rollout_path.to_string_lossy());
+        let copied_content = fs::read_to_string(copied_rollout).expect("read copied rollout");
+        let copied_meta: Value =
+            serde_json::from_str(copied_content.lines().next().expect("copied rollout meta"))
+                .expect("parse copied rollout meta");
+        assert_eq!(
+            copied_meta
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_str),
+            Some(copied_session_id.as_str())
+        );
+        assert_eq!(
+            copied_meta
+                .get("payload")
+                .and_then(|payload| payload.get("model_provider"))
+                .and_then(Value::as_str),
+            Some("oneTop")
         );
 
         let _ = fs::remove_dir_all(root);
