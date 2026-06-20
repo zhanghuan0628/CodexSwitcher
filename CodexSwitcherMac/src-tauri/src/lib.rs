@@ -3961,6 +3961,24 @@ fn codex_thread_sandbox_policy(workspace_path: &str) -> String {
     .to_string()
 }
 
+fn sqlite_table_has_column(
+    connection: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = ?1",
+                table_name
+            ),
+            [column_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .map_err(|error| error.to_string())
+}
+
 fn first_user_message_from_rollout(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -3979,6 +3997,78 @@ fn first_user_message_from_rollout(path: &Path) -> Option<String> {
                 None
             }
         })
+}
+
+fn codex_thread_preview(title: &str, first_user_message: &str) -> String {
+    let title = title.trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+
+    first_user_message.trim().to_string()
+}
+
+fn refresh_codex_state_thread_visibility_metadata(
+    state: &Connection,
+    session_id: &str,
+    preview: &str,
+    updated_at: i64,
+    updated_at_ms: i64,
+) -> Result<(), String> {
+    if sqlite_table_has_column(state, "threads", "thread_source")? {
+        state
+            .execute(
+                "UPDATE threads
+                 SET thread_source = COALESCE(NULLIF(thread_source, ''), 'user')
+                 WHERE id = ?1",
+                [session_id],
+            )
+            .map_err(|error| format!("更新 Codex thread 来源失败：{}", error))?;
+    }
+
+    if sqlite_table_has_column(state, "threads", "preview")? {
+        state
+            .execute(
+                "UPDATE threads
+                 SET preview = CASE
+                    WHEN TRIM(COALESCE(preview, '')) = '' THEN ?1
+                    ELSE preview
+                 END
+                 WHERE id = ?2",
+                params![preview, session_id],
+            )
+            .map_err(|error| format!("更新 Codex thread 预览失败：{}", error))?;
+    }
+
+    if sqlite_table_has_column(state, "threads", "recency_at")? {
+        state
+            .execute(
+                "UPDATE threads
+                 SET recency_at = CASE
+                    WHEN COALESCE(recency_at, 0) = 0 THEN ?1
+                    ELSE recency_at
+                 END
+                 WHERE id = ?2",
+                params![updated_at, session_id],
+            )
+            .map_err(|error| format!("更新 Codex thread 最近时间失败：{}", error))?;
+    }
+
+    if sqlite_table_has_column(state, "threads", "recency_at_ms")? {
+        state
+            .execute(
+                "UPDATE threads
+                 SET recency_at_ms = CASE
+                    WHEN COALESCE(recency_at_ms, 0) = 0 THEN ?1
+                    ELSE recency_at_ms
+                 END
+                 WHERE id = ?2",
+                params![updated_at_ms, session_id],
+            )
+            .map_err(|error| format!("更新 Codex thread 最近时间毫秒失败：{}", error))?;
+    }
+
+    Ok(())
 }
 
 fn upsert_codex_state_thread_for_session(
@@ -4005,6 +4095,7 @@ fn upsert_codex_state_thread_for_session(
     let updated_at_ms = updated_at * 1000;
     let sandbox_policy = codex_thread_sandbox_policy(&session.workspace_path);
     let first_user_message = first_user_message_from_rollout(rollout_path).unwrap_or_default();
+    let preview = codex_thread_preview(&session.title, &first_user_message);
     let model_provider = codex_writeback_model_provider(connection, codex_dir, session, owner);
     sync_rollout_session_meta_model_provider(rollout_path, &model_provider)?;
     state
@@ -4049,6 +4140,14 @@ fn upsert_codex_state_thread_for_session(
             ],
         )
         .map_err(|error| format!("注册 Codex thread 失败：{}", error))?;
+
+    refresh_codex_state_thread_visibility_metadata(
+        &state,
+        &session.session_id,
+        &preview,
+        updated_at,
+        updated_at_ms,
+    )?;
 
     Ok(true)
 }
@@ -4595,7 +4694,7 @@ fn backfill_codex_imported_state_model_providers_for_dir(
         };
         let thread = state
             .query_row(
-                "SELECT model_provider, source, archived, rollout_path
+                "SELECT model_provider, source, archived, rollout_path, title, updated_at, updated_at_ms
                  FROM threads
                  WHERE id = ?1",
                 [external_session_id.as_str()],
@@ -4605,30 +4704,55 @@ fn backfill_codex_imported_state_model_providers_for_dir(
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
                     ))
                 },
             )
             .optional();
-        let Ok(Some((model_provider, source, archived, rollout_path))) = thread else {
+        let Ok(Some((
+            model_provider,
+            source,
+            archived,
+            rollout_path,
+            title,
+            updated_at,
+            updated_at_ms,
+        ))) = thread
+        else {
             continue;
         };
         if !is_main_codex_thread_source(&source) {
             continue;
         }
-        if model_provider == expected_provider && archived == 0 {
-            continue;
-        }
 
-        if let Err(_) = state.execute(
-            "UPDATE threads
-             SET model_provider = ?1, archived = 0, archived_at = NULL
-             WHERE id = ?2 AND source = 'vscode'",
-            params![expected_provider, external_session_id],
-        ) {
-            continue;
+        if model_provider != expected_provider || archived != 0 {
+            if let Err(_) = state.execute(
+                "UPDATE threads
+                 SET model_provider = ?1, archived = 0, archived_at = NULL
+                 WHERE id = ?2 AND source = 'vscode'",
+                params![expected_provider, external_session_id],
+            ) {
+                continue;
+            }
         }
 
         let rollout_path = Path::new(&rollout_path);
+        let first_user_message = first_user_message_from_rollout(rollout_path).unwrap_or_default();
+        let preview = codex_thread_preview(&title, &first_user_message);
+        if refresh_codex_state_thread_visibility_metadata(
+            &state,
+            &external_session_id,
+            &preview,
+            updated_at,
+            updated_at_ms.unwrap_or(updated_at * 1000),
+        )
+        .is_err()
+        {
+            continue;
+        }
+
         if rollout_path.exists() {
             let _ = sync_rollout_session_meta_model_provider(rollout_path, &expected_provider);
         }
@@ -8465,7 +8589,11 @@ mod tests {
                     reasoning_effort TEXT,
                     agent_path TEXT,
                     created_at_ms INTEGER,
-                    updated_at_ms INTEGER
+                    updated_at_ms INTEGER,
+                    thread_source TEXT,
+                    preview TEXT NOT NULL DEFAULT '',
+                    recency_at INTEGER NOT NULL DEFAULT 0,
+                    recency_at_ms INTEGER NOT NULL DEFAULT 0
                 );",
             )
             .expect("create threads table");
@@ -9996,9 +10124,20 @@ mod tests {
         assert_eq!(result.codex_skipped_threads, 0);
 
         let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
-        let synced: (String, String, i64, String, String) = state
+        let synced: (
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = state
             .query_row(
-                "SELECT title, cwd, archived, first_user_message, model_provider
+                "SELECT title, cwd, archived, first_user_message, model_provider,
+                        thread_source, preview, recency_at, recency_at_ms
                  FROM threads WHERE id = 'register-thread'",
                 [],
                 |row| {
@@ -10008,6 +10147,10 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -10017,6 +10160,10 @@ mod tests {
         assert_eq!(synced.2, 0);
         assert_eq!(synced.3, "同步到 Codex 侧边栏");
         assert_eq!(synced.4, "openai");
+        assert_eq!(synced.5, "user");
+        assert_eq!(synced.6, "同步到 Codex");
+        assert_eq!(synced.7, 1777176060);
+        assert_eq!(synced.8, 1777176060000);
         let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
         let first_line = rollout_content.lines().next().expect("rollout meta line");
         let meta: Value = serde_json::from_str(first_line).expect("parse rollout meta");
