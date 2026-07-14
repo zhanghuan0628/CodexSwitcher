@@ -13,6 +13,7 @@ import {
   statusText,
   switchButtonText,
   switchHintText,
+  usagePercentText,
 } from "./viewModel";
 
 type AccountDetailDrawerProps = {
@@ -173,7 +174,7 @@ export function AccountDetailDrawer({
               items={(accountDetail?.recent_snapshots ?? []).map((snapshot) => ({
                 id: `${snapshot.account_id}-${snapshot.sample_time}`,
                 title: snapshot.sample_time,
-                body: `5h 剩余 ${snapshot.window_5h_percent}% · 7d 剩余 ${snapshot.window_7d_percent}%`,
+                body: `5h 剩余 ${usagePercentText(snapshot, "window_5h_percent")} · 7d 剩余 ${usagePercentText(snapshot, "window_7d_percent")}`,
                 meta: statusLabel(snapshot.risk_level),
               }))}
               emptyTitle="暂无采样记录"

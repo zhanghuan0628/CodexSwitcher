@@ -11,6 +11,7 @@ import {
   recommendationReasonText,
   switchButtonText,
   timelineNextActionLabel,
+  usagePercentText,
   usageSourceText,
 } from "./viewModel";
 
@@ -243,8 +244,8 @@ function DashboardPageInner({
             autoSampleStatus,
           })}
           metrics={currentIsKey ? keyMetrics(activeIdentity) : [
-            { label: "5h 剩余", value: latestSnapshot ? `${latestSnapshot.window_5h_percent}%` : "--" },
-            { label: "7d 剩余", value: latestSnapshot ? `${latestSnapshot.window_7d_percent}%` : "--" },
+            { label: "5h 剩余", value: usagePercentText(latestSnapshot, "window_5h_percent") },
+            { label: "7d 剩余", value: usagePercentText(latestSnapshot, "window_7d_percent") },
             { label: "5h 恢复", value: latestSnapshot?.estimated_reset_5h_at ?? (activeAccount?.is_real_session ? "未知" : "待采样") },
             { label: "7d 恢复", value: latestSnapshot?.estimated_reset_7d_at ?? (activeAccount?.is_real_session ? "未知" : "待采样") },
           ]}
@@ -294,8 +295,8 @@ function DashboardPageInner({
             ? `可启用 Key：${recommendedIdentity.title} · ${recommendedIdentity.profile.model ?? "未设置模型"}`
             : recommendationReasonText(recommendedSwitchAccount, overview.recommended_reason, recommendationList)}
           metrics={recommendedIsKey ? keyMetrics(recommendedIdentity) : [
-            { label: "5h 剩余", value: recommendedSwitchAccount ? `${recommendedSwitchAccount.latest_snapshot?.window_5h_percent ?? "--"}%` : "--" },
-            { label: "7d 剩余", value: recommendedSwitchAccount ? `${recommendedSwitchAccount.latest_snapshot?.window_7d_percent ?? "--"}%` : "--" },
+            { label: "5h 剩余", value: usagePercentText(recommendedSwitchAccount?.latest_snapshot, "window_5h_percent") },
+            { label: "7d 剩余", value: usagePercentText(recommendedSwitchAccount?.latest_snapshot, "window_7d_percent") },
             { label: "5h 恢复", value: accountResetTime(recommendedSwitchAccount, "estimated_reset_5h_at") },
             { label: "7d 恢复", value: accountResetTime(recommendedSwitchAccount, "estimated_reset_7d_at") },
           ]}

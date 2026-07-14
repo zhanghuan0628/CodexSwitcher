@@ -46,9 +46,9 @@ use tauri::{
     Manager, RunEvent, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 use usage::{
-    insert_real_usage_snapshot, query_latest_real_usage_snapshot, query_latest_snapshot,
-    read_real_usage_from_credentials, RealUsageReadError, RealUsageReadErrorKind, RealUsageReading,
-    UsageSnapshot,
+    insert_real_usage_snapshot, lowest_known_remaining, query_latest_real_usage_snapshot,
+    query_latest_snapshot, read_real_usage_from_credentials, usage_percent_text,
+    RealUsageReadError, RealUsageReadErrorKind, RealUsageReading, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -5295,8 +5295,10 @@ fn account_health_timeline(snapshots: &[UsageSnapshot]) -> Vec<TimelineSegment> 
             hours: 1,
             label: snapshot.sample_time.clone(),
             tooltip: format!(
-                "5h 剩余 {}%，7d 剩余 {}%，可信度 {}",
-                snapshot.window_5h_percent, snapshot.window_7d_percent, snapshot.confidence_level
+                "5h 剩余 {}，7d 剩余 {}，可信度 {}",
+                usage_percent_text(snapshot.window_5h_percent),
+                usage_percent_text(snapshot.window_7d_percent),
+                snapshot.confidence_level
             ),
         })
         .collect()
@@ -5595,9 +5597,9 @@ fn build_usage_display_state(
                     source_type: snapshot.source_type.clone(),
                     confidence_label: snapshot.confidence_level.clone(),
                     summary: format!(
-                        "5h 剩余 {}% · 7d 剩余 {}% · 5h 恢复 {} · 7d 恢复 {} · {}",
-                        snapshot.window_5h_percent,
-                        snapshot.window_7d_percent,
+                        "5h 剩余 {} · 7d 剩余 {} · 5h 恢复 {} · 7d 恢复 {} · {}",
+                        usage_percent_text(snapshot.window_5h_percent),
+                        usage_percent_text(snapshot.window_7d_percent),
                         snapshot.estimated_reset_5h_at.as_deref().unwrap_or("未知"),
                         snapshot.estimated_reset_7d_at.as_deref().unwrap_or("未知"),
                         chart_source_label(&snapshot.source_type)
@@ -5913,16 +5915,27 @@ fn recommended_switch_candidate(
             continue;
         };
 
-        let max_percent = snapshot.window_5h_percent.min(snapshot.window_7d_percent);
-        let total_percent = snapshot.window_5h_percent + snapshot.window_7d_percent;
-        let risk_window = if snapshot.window_5h_percent <= snapshot.window_7d_percent {
-            "5h"
-        } else {
-            "7d"
+        let known_windows = [
+            ("5h", snapshot.window_5h_percent),
+            ("7d", snapshot.window_7d_percent),
+        ]
+        .into_iter()
+        .filter(|(_, percent)| *percent >= 0)
+        .collect::<Vec<_>>();
+        let Some((risk_window, max_percent)) = known_windows
+            .iter()
+            .min_by_key(|(_, percent)| *percent)
+            .copied()
+        else {
+            continue;
         };
+        let total_percent = known_windows.iter().map(|(_, percent)| percent).sum();
         let reason = format!(
-            "{} 当前 5h 剩余 {}%，7d 剩余 {}%，优先风险来自 {} 窗口。",
-            account.nickname, snapshot.window_5h_percent, snapshot.window_7d_percent, risk_window
+            "{} 当前 5h 剩余 {}，7d 剩余 {}，优先风险来自 {} 窗口。",
+            account.nickname,
+            usage_percent_text(snapshot.window_5h_percent),
+            usage_percent_text(snapshot.window_7d_percent),
+            risk_window
         );
 
         let candidate = RecommendationCandidate {
@@ -6026,9 +6039,16 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                 };
             };
 
-            let dominant_is_five = snapshot.window_5h_percent <= snapshot.window_7d_percent;
-            let dominant_label = if dominant_is_five { "5h" } else { "7d" };
-            let dominant_percent = snapshot.window_5h_percent.min(snapshot.window_7d_percent);
+            let (dominant_label, dominant_percent) = [
+                ("5h", snapshot.window_5h_percent),
+                ("7d", snapshot.window_7d_percent),
+            ]
+            .into_iter()
+            .filter(|(_, percent)| *percent >= 0)
+            .min_by_key(|(_, percent)| *percent)
+            .unwrap_or(("未知", 100));
+            let window_5h_text = usage_percent_text(snapshot.window_5h_percent);
+            let window_7d_text = usage_percent_text(snapshot.window_7d_percent);
             let reset_5h = snapshot.estimated_reset_5h_at.as_deref().unwrap_or("未知");
             let reset_7d = snapshot.estimated_reset_7d_at.as_deref().unwrap_or("未知");
             let recommended_now = recommended_account_id == Some(account.id);
@@ -6042,11 +6062,8 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                             4,
                             "等待恢复",
                             format!(
-                                "5h 剩余 {}%，7d 剩余 {}%；5h 恢复 {}；7d 恢复 {}",
-                                snapshot.window_5h_percent,
-                                snapshot.window_7d_percent,
-                                reset_5h,
-                                reset_7d
+                                "5h 剩余 {}，7d 剩余 {}；5h 恢复 {}；7d 恢复 {}",
+                                window_5h_text, window_7d_text, reset_5h, reset_7d
                             ),
                         ),
                         timeline_segment(
@@ -6072,10 +6089,8 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                             4,
                             "预警观察",
                             format!(
-                                "5h 剩余 {}%，7d 剩余 {}%；主风险来自 {} 窗口。",
-                                snapshot.window_5h_percent,
-                                snapshot.window_7d_percent,
-                                dominant_label
+                                "5h 剩余 {}，7d 剩余 {}；主风险来自 {} 窗口。",
+                                window_5h_text, window_7d_text, dominant_label
                             ),
                         ),
                         timeline_segment(
@@ -6112,11 +6127,8 @@ fn build_timeline(connection: &Connection, accounts: &[Account]) -> Vec<Timeline
                                 "当前可用"
                             },
                             format!(
-                                "5h 剩余 {}%，7d 剩余 {}%；5h 恢复 {}；7d 恢复 {}",
-                                snapshot.window_5h_percent,
-                                snapshot.window_7d_percent,
-                                reset_5h,
-                                reset_7d
+                                "5h 剩余 {}，7d 剩余 {}；5h 恢复 {}；7d 恢复 {}",
+                                window_5h_text, window_7d_text, reset_5h, reset_7d
                             ),
                         ),
                         timeline_segment(
@@ -6196,7 +6208,9 @@ fn build_recommendations(
                 );
             }
         } else if let Some(snapshot) = latest_snapshot {
-            let lowest_remaining = snapshot.window_5h_percent.min(snapshot.window_7d_percent);
+            let lowest_remaining =
+                lowest_known_remaining(snapshot.window_5h_percent, snapshot.window_7d_percent)
+                    .unwrap_or(100);
             let high_remaining_warning = (100 - settings.warn_threshold_high).max(0);
             let mid_remaining_warning = (100 - settings.warn_threshold_mid).max(0);
             if lowest_remaining <= 0 {
@@ -8318,35 +8332,31 @@ fn current_tray_presentation(connection: &Connection) -> TrayPresentation {
 
                 if let Some(snapshot) = overview.latest_snapshot {
                     let prefix = tray_status_prefix(&snapshot.risk_level);
+                    let window_5h_text = usage_percent_text(snapshot.window_5h_percent);
+                    let window_7d_text = usage_percent_text(snapshot.window_7d_percent);
                     let title = if prefix.is_empty() {
-                        format!(
-                            "{} {}/{}",
-                            active.nickname, snapshot.window_5h_percent, snapshot.window_7d_percent
-                        )
+                        format!("{} {}/{}", active.nickname, window_5h_text, window_7d_text)
                     } else {
                         format!(
                             "{} {} {}/{}",
-                            prefix,
-                            active.nickname,
-                            snapshot.window_5h_percent,
-                            snapshot.window_7d_percent
+                            prefix, active.nickname, window_5h_text, window_7d_text
                         )
                     };
                     let tooltip = format!(
-                        "{}｜状态 {}｜5h剩余 {}%｜7d剩余 {}%｜5h恢复 {}｜7d恢复 {}",
+                        "{}｜状态 {}｜5h剩余 {}｜7d剩余 {}｜5h恢复 {}｜7d恢复 {}",
                         active.nickname,
                         tray_status_text(&active.status),
-                        snapshot.window_5h_percent,
-                        snapshot.window_7d_percent,
+                        window_5h_text,
+                        window_7d_text,
                         snapshot.estimated_reset_5h_at.as_deref().unwrap_or("未知"),
                         snapshot.estimated_reset_7d_at.as_deref().unwrap_or("未知"),
                     );
                     let detail = format!(
-                        "当前：{} · 状态 {} · 5h剩余 {}% · 7d剩余 {}%",
+                        "当前：{} · 状态 {} · 5h剩余 {} · 7d剩余 {}",
                         active.nickname,
                         tray_status_text(&active.status),
-                        snapshot.window_5h_percent,
-                        snapshot.window_7d_percent,
+                        window_5h_text,
+                        window_7d_text,
                     );
                     let sampling = format!("最近采样：{}", snapshot.sample_time);
                     return TrayPresentation {

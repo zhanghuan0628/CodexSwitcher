@@ -9,6 +9,9 @@ const REAL_USAGE_ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
 const REAL_USAGE_MAX_ATTEMPTS: usize = 2;
 const REAL_USAGE_RETRY_DELAY_MS: u64 = 250;
 const REAL_USAGE_TIMEOUT_SECS: u64 = 6;
+const FIVE_HOUR_WINDOW_SECONDS: i64 = 5 * 60 * 60;
+const SEVEN_DAY_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub(crate) const UNKNOWN_WINDOW_PERCENT: i64 = -1;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
@@ -125,7 +128,27 @@ pub(crate) fn usage_risk_from_windows(
     window_5h_percent: i64,
     window_7d_percent: i64,
 ) -> AccountStatus {
-    AccountStatus::from_remaining_percent(window_5h_percent.min(window_7d_percent))
+    lowest_known_remaining(window_5h_percent, window_7d_percent)
+        .map(AccountStatus::from_remaining_percent)
+        .unwrap_or(AccountStatus::Healthy)
+}
+
+pub(crate) fn lowest_known_remaining(
+    window_5h_percent: i64,
+    window_7d_percent: i64,
+) -> Option<i64> {
+    [window_5h_percent, window_7d_percent]
+        .into_iter()
+        .filter(|percent| *percent >= 0)
+        .min()
+}
+
+pub(crate) fn usage_percent_text(percent: i64) -> String {
+    if percent < 0 {
+        "--".to_string()
+    } else {
+        format!("{}%", percent)
+    }
 }
 
 fn parse_real_usage_read_state(credentials_json: &str) -> Result<RealUsageReadState, String> {
@@ -154,6 +177,76 @@ fn remaining_percent_from_used(value: Option<f64>) -> Option<i64> {
 
 fn has_valid_window_duration(window: &WhamUsageWindow) -> bool {
     window.limit_window_seconds.unwrap_or(0) > 0
+}
+
+fn assign_usage_window<'a>(
+    window: &'a WhamUsageWindow,
+    fallback_is_five_hour: bool,
+    five_hour: &mut Option<&'a WhamUsageWindow>,
+    seven_day: &mut Option<&'a WhamUsageWindow>,
+) {
+    match window.limit_window_seconds {
+        Some(FIVE_HOUR_WINDOW_SECONDS) => *five_hour = Some(window),
+        Some(SEVEN_DAY_WINDOW_SECONDS) => *seven_day = Some(window),
+        _ if fallback_is_five_hour && five_hour.is_none() => *five_hour = Some(window),
+        _ if seven_day.is_none() => *seven_day = Some(window),
+        _ => {}
+    }
+}
+
+fn parse_real_usage_payload(
+    account_id: i64,
+    profile_ref: Option<&str>,
+    payload: &Value,
+) -> Result<Option<RealUsageReading>, RealUsageReadError> {
+    let envelope: WhamUsageEnvelope =
+        serde_json::from_value(payload.clone()).map_err(|error| RealUsageReadError {
+            kind: RealUsageReadErrorKind::Other,
+            message: format!("解析真实额度结构失败：{}", error),
+        })?;
+    let Some(rate_limit) = envelope.rate_limit else {
+        return Ok(None);
+    };
+
+    let mut five_hour = None;
+    let mut seven_day = None;
+    if let Some(primary) = rate_limit.primary_window.as_ref() {
+        if has_valid_window_duration(primary) {
+            assign_usage_window(primary, true, &mut five_hour, &mut seven_day);
+        }
+    }
+    if let Some(secondary) = rate_limit.secondary_window.as_ref() {
+        if has_valid_window_duration(secondary) {
+            assign_usage_window(secondary, false, &mut five_hour, &mut seven_day);
+        }
+    }
+
+    let window_5h_percent = five_hour
+        .and_then(|window| remaining_percent_from_used(window.used_percent))
+        .unwrap_or(UNKNOWN_WINDOW_PERCENT);
+    let window_7d_percent = seven_day
+        .and_then(|window| remaining_percent_from_used(window.used_percent))
+        .unwrap_or(UNKNOWN_WINDOW_PERCENT);
+    if window_5h_percent == UNKNOWN_WINDOW_PERCENT && window_7d_percent == UNKNOWN_WINDOW_PERCENT {
+        return Ok(None);
+    }
+
+    let is_partial =
+        window_5h_percent == UNKNOWN_WINDOW_PERCENT || window_7d_percent == UNKNOWN_WINDOW_PERCENT;
+    Ok(Some(RealUsageReading {
+        window_5h_percent,
+        window_7d_percent,
+        confidence_label: if is_partial {
+            "精确（部分窗口）".to_string()
+        } else {
+            "精确".to_string()
+        },
+        estimated_reset_5h_at: five_hour
+            .and_then(|window| unix_seconds_to_local_text(window.reset_at)),
+        estimated_reset_7d_at: seven_day
+            .and_then(|window| unix_seconds_to_local_text(window.reset_at)),
+        raw_meta_json: build_real_usage_meta_json(account_id, profile_ref, payload),
+    }))
 }
 
 fn unix_seconds_to_local_text(value: Option<i64>) -> Option<String> {
@@ -356,43 +449,7 @@ pub(crate) fn read_real_usage_from_credentials(
     else {
         return Ok(None);
     };
-    let envelope: WhamUsageEnvelope =
-        serde_json::from_value(payload.clone()).map_err(|error| RealUsageReadError {
-            kind: RealUsageReadErrorKind::Other,
-            message: format!("解析真实额度结构失败：{}", error),
-        })?;
-    let Some(rate_limit) = envelope.rate_limit else {
-        return Ok(None);
-    };
-    let Some(primary) = rate_limit.primary_window else {
-        return Ok(None);
-    };
-    if !has_valid_window_duration(&primary) {
-        return Ok(None);
-    }
-
-    let Some(window_5h_percent) = remaining_percent_from_used(primary.used_percent) else {
-        return Ok(None);
-    };
-    let Some(secondary) = rate_limit.secondary_window else {
-        return Ok(None);
-    };
-    if !has_valid_window_duration(&secondary) {
-        return Ok(None);
-    }
-    let Some(window_7d_percent) = remaining_percent_from_used(secondary.used_percent) else {
-        return Ok(None);
-    };
-    let estimated_reset_7d_at = unix_seconds_to_local_text(secondary.reset_at);
-
-    Ok(Some(RealUsageReading {
-        window_5h_percent,
-        window_7d_percent,
-        confidence_label: "精确".to_string(),
-        estimated_reset_5h_at: unix_seconds_to_local_text(primary.reset_at),
-        estimated_reset_7d_at,
-        raw_meta_json: build_real_usage_meta_json(account_id, profile_ref, &payload),
-    }))
+    parse_real_usage_payload(account_id, profile_ref, &payload)
 }
 
 pub(crate) fn insert_real_usage_snapshot(
@@ -404,16 +461,25 @@ pub(crate) fn insert_real_usage_snapshot(
     let risk = usage_risk_from_windows(reading.window_5h_percent, reading.window_7d_percent)
         .as_str()
         .to_string();
-    let estimated_5h = reading.estimated_reset_5h_at.clone().unwrap_or_else(|| {
-        (sample_at + Duration::minutes((100 - reading.window_5h_percent).max(1)))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
-    });
-    let estimated_7d = reading.estimated_reset_7d_at.clone().unwrap_or_else(|| {
-        (sample_at + Duration::hours(((100 - reading.window_7d_percent) / 4).max(2)))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
-    });
+    let estimated_5h = if reading.window_5h_percent == UNKNOWN_WINDOW_PERCENT {
+        None
+    } else {
+        Some(reading.estimated_reset_5h_at.clone().unwrap_or_else(|| {
+            (sample_at + Duration::minutes((100 - reading.window_5h_percent).max(1)))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }))
+    };
+    let estimated_7d = if reading.window_7d_percent == UNKNOWN_WINDOW_PERCENT {
+        None
+    } else {
+        Some(reading.estimated_reset_7d_at.clone().unwrap_or_else(|| {
+            (sample_at + Duration::hours(((100 - reading.window_7d_percent) / 4).max(2)))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }))
+    };
+    let account_reset_time = estimated_5h.clone().or_else(|| estimated_7d.clone());
     let sample_text = sample_at.format("%Y-%m-%d %H:%M:%S").to_string();
 
     connection
@@ -437,7 +503,7 @@ pub(crate) fn insert_real_usage_snapshot(
     connection
         .execute(
             "UPDATE accounts SET status = ?1, auth_state = 'valid', last_verified_at = ?2, last_check_time = ?2, estimated_reset_time = ?3, updated_at = ?2 WHERE id = ?4",
-            params![risk, sample_text, estimated_5h, account_id],
+            params![risk, sample_text, account_reset_time, account_id],
         )
         .map_err(|error| error.to_string())?;
 
@@ -657,6 +723,63 @@ mod tests {
             reset_at: None,
             limit_window_seconds: Some(0),
         }));
+    }
+
+    #[test]
+    fn parses_classic_five_hour_and_weekly_windows() {
+        let payload = serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 73,
+                    "reset_at": 1_800_000_000,
+                    "limit_window_seconds": 18_000
+                },
+                "secondary_window": {
+                    "used_percent": 78,
+                    "reset_at": 1_800_100_000,
+                    "limit_window_seconds": 604_800
+                }
+            }
+        });
+
+        let reading = parse_real_usage_payload(1, Some("account"), &payload)
+            .expect("parse")
+            .expect("reading");
+
+        assert_eq!(reading.window_5h_percent, 27);
+        assert_eq!(reading.window_7d_percent, 22);
+        assert_eq!(reading.confidence_label, "精确");
+        assert!(reading.estimated_reset_5h_at.is_some());
+        assert!(reading.estimated_reset_7d_at.is_some());
+    }
+
+    #[test]
+    fn parses_single_weekly_window_without_inventing_five_hour_quota() {
+        let payload = serde_json::json!({
+            "plan_type": "prolite",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 12,
+                    "reset_at": 1_800_100_000,
+                    "limit_window_seconds": 604_800
+                },
+                "secondary_window": null
+            }
+        });
+
+        let reading = parse_real_usage_payload(1, Some("account"), &payload)
+            .expect("parse")
+            .expect("reading");
+
+        assert_eq!(reading.window_5h_percent, UNKNOWN_WINDOW_PERCENT);
+        assert_eq!(reading.window_7d_percent, 88);
+        assert_eq!(reading.confidence_label, "精确（部分窗口）");
+        assert!(reading.estimated_reset_5h_at.is_none());
+        assert!(reading.estimated_reset_7d_at.is_some());
+        assert_eq!(usage_risk_from_windows(-1, 88).as_str(), "healthy");
+        assert_eq!(usage_percent_text(-1), "--");
     }
 
     #[test]

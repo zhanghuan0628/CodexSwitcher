@@ -12,6 +12,7 @@ import type {
   StartupSummary,
   StartupSummaryItem,
   StartupSummaryTone,
+  UsageSnapshot,
 } from "../types";
 
 export const authStateText: Record<AccountAuthState, string> = {
@@ -116,10 +117,17 @@ export function accountSnapshot(account?: Account | null) {
   return account?.latest_snapshot ?? null;
 }
 
+export function usagePercentText(
+  snapshot: UsageSnapshot | null | undefined,
+  key: "window_5h_percent" | "window_7d_percent",
+) {
+  const percent = snapshot?.[key];
+  if (percent === undefined || percent < 0) return "--";
+  return `${percent}%`;
+}
+
 export function accountUsagePercent(account?: Account | null, key: "window_5h_percent" | "window_7d_percent" = "window_5h_percent") {
-  const snapshot = accountSnapshot(account);
-  if (!snapshot) return "--";
-  return `${snapshot[key]}%`;
+  return usagePercentText(accountSnapshot(account), key);
 }
 
 export function accountResetTime(account: Account | null | undefined, key: "estimated_reset_5h_at" | "estimated_reset_7d_at") {
