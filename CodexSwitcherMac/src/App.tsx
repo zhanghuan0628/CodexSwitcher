@@ -853,7 +853,7 @@ function App() {
       if (plan.supportingData) {
         await loadSupportingData();
       }
-      setMessage("账号切换成功；状态会在后台马上刷新。");
+      setMessage("账号切换成功；Codex 将自动重启并只显示官方会话。");
     } catch (error) {
       const detail = friendlyErrorText(error);
       setLastOperationError(detail);
@@ -1047,9 +1047,9 @@ function App() {
         });
       }
       if (profile.profile_kind === "third_party_key") {
-        setMessage(`${profile.nickname} 已启用，并已写入 Codex auth.json/config.toml`);
+        setMessage(`${profile.nickname} 已启用；Codex 将自动重启并只显示该 Key 的会话`);
       } else {
-        setMessage(`${profile.nickname} 已设为当前身份`);
+        setMessage(`${profile.nickname} 已设为当前身份；Codex 将自动重启并只显示官方会话`);
       }
     } catch (error) {
       const detail = friendlyErrorText(error);

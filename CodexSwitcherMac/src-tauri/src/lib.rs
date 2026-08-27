@@ -26,15 +26,15 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
-        Mutex,
+        mpsc, Mutex,
     },
     thread,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 use switching::{
     insert_switch_log, is_switchable, latest_switch_for_account, query_recent_switches_for_account,
@@ -2406,12 +2406,24 @@ fn read_codex_config_model_provider_from_dir(config_dir: &Path) -> Option<String
 }
 
 fn key_profile_model_provider(profile: &CredentialProfile) -> String {
+    // `model_provider` is persisted in Codex's shared thread index.  A human
+    // provider name (for example "taomu") is not unique when more than one
+    // Key uses the same gateway, so it cannot be used as a session owner.
+    format!("codexswitcher-key-{}", profile.id)
+}
+
+fn key_profile_display_name(profile: &CredentialProfile) -> String {
     let provider = profile.provider.trim();
-    if provider.is_empty() {
-        "custom".to_string()
-    } else {
-        provider.to_string()
+    if !provider.is_empty() {
+        return provider.to_string();
     }
+
+    let nickname = profile.nickname.trim();
+    if !nickname.is_empty() {
+        return nickname.to_string();
+    }
+
+    "第三方 Key".to_string()
 }
 
 fn normalize_openai_base_url(base_url: &str) -> String {
@@ -2799,6 +2811,7 @@ fn write_key_profile_runtime_files(
         .map_err(|error| format!("创建 Codex 配置目录失败：{}", error))?;
 
     let model_provider = key_profile_model_provider(profile);
+    let display_name = key_profile_display_name(profile);
     let auth_json = format!(
         "{{\"OPENAI_API_KEY\":\"{}\"}}\n",
         escape_json_string(api_key)
@@ -2808,7 +2821,7 @@ fn write_key_profile_runtime_files(
         escape_toml_basic_string(&model_provider),
         escape_toml_basic_string(model),
         escape_toml_basic_string(&model_provider),
-        escape_toml_basic_string(&model_provider),
+        escape_toml_basic_string(&display_name),
         escape_toml_basic_string(&base_url),
     );
 
@@ -3223,6 +3236,7 @@ fn query_session_records(connection: &Connection) -> Result<Vec<SessionRecord>, 
     backfill_codex_imported_session_titles(connection)?;
     backfill_codex_imported_session_owners(connection)?;
     backfill_codex_imported_state_model_providers(connection)?;
+    sync_codex_thread_visibility_for_active_owner(connection)?;
     let mut stmt = connection
         .prepare(
             "SELECT s.id, s.project_id, p.name, p.workspace_path, s.owner_account_id,
@@ -3778,7 +3792,7 @@ fn codex_writeback_model_provider(
     session: &ParsedCodexLocalSession,
     owner: &SessionOwner,
 ) -> String {
-    codex_model_provider_for_owner(connection, codex_dir, owner, true)
+    codex_model_provider_for_owner(connection, codex_dir, owner, false)
         .unwrap_or_else(|| session.model_provider.clone())
 }
 
@@ -3893,10 +3907,16 @@ fn copy_rollout_for_imported_owner(
         session.session_id, owner.profile_kind, owner.profile_ref
     );
     let cloned_session_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, clone_key.as_bytes()).to_string();
-    let target_dir = codex_dir.join("sessions").join("codexswitcher-imported");
+    let target_path = canonical_codex_session_rollout_path(
+        codex_dir,
+        &cloned_session_id,
+        codex_unix_timestamp_from_local_text(&session.created_at),
+    );
+    let target_dir = target_path
+        .parent()
+        .ok_or_else(|| "无法确定 Codex 导入会话目录。".to_string())?;
     fs::create_dir_all(&target_dir)
         .map_err(|error| format!("创建 Codex 导入会话目录失败：{}", error))?;
-    let target_path = target_dir.join(format!("rollout-{}.jsonl", cloned_session_id));
 
     let source_path = Path::new(&session.source_path);
     let content = fs::read_to_string(source_path)
@@ -4714,7 +4734,7 @@ fn backfill_codex_imported_state_model_providers_for_dir(
         let Ok(Some((
             model_provider,
             source,
-            archived,
+            _archived,
             rollout_path,
             title,
             updated_at,
@@ -4727,15 +4747,17 @@ fn backfill_codex_imported_state_model_providers_for_dir(
             continue;
         }
 
-        if model_provider != expected_provider || archived != 0 {
-            if let Err(_) = state.execute(
-                "UPDATE threads
-                 SET model_provider = ?1, archived = 0, archived_at = NULL
+        if model_provider != expected_provider
+            && state
+                .execute(
+                    "UPDATE threads
+                 SET model_provider = ?1
                  WHERE id = ?2 AND source = 'vscode'",
-                params![expected_provider, external_session_id],
-            ) {
-                continue;
-            }
+                    params![expected_provider, external_session_id],
+                )
+                .is_err()
+        {
+            continue;
         }
 
         let rollout_path = Path::new(&rollout_path);
@@ -4766,6 +4788,501 @@ fn backfill_codex_imported_state_model_providers(connection: &Connection) -> Res
         return Ok(());
     };
     backfill_codex_imported_state_model_providers_for_dir(connection, &codex_dir)
+}
+
+#[derive(Debug)]
+struct CodexThreadArchiveAction {
+    thread_id: String,
+    method: &'static str,
+}
+
+fn canonical_codex_session_rollout_path(
+    codex_dir: &Path,
+    thread_id: &str,
+    created_at: i64,
+) -> PathBuf {
+    let created_at = Local
+        .timestamp_opt(created_at, 0)
+        .single()
+        .unwrap_or_else(Local::now);
+    codex_dir
+        .join("sessions")
+        .join(created_at.format("%Y").to_string())
+        .join(created_at.format("%m").to_string())
+        .join(created_at.format("%d").to_string())
+        .join(format!(
+            "rollout-{}-{}.jsonl",
+            created_at.format("%Y-%m-%dT%H-%M-%S"),
+            thread_id
+        ))
+}
+
+fn migrate_legacy_imported_rollout_path(
+    state: &Connection,
+    codex_dir: &Path,
+    thread_id: &str,
+    created_at: i64,
+    rollout_path: PathBuf,
+) -> Result<PathBuf, String> {
+    let legacy_dir = codex_dir.join("sessions").join("codexswitcher-imported");
+    if !rollout_path.starts_with(&legacy_dir) || !rollout_path.exists() {
+        return Ok(rollout_path);
+    }
+
+    let target_path = canonical_codex_session_rollout_path(codex_dir, thread_id, created_at);
+    if target_path == rollout_path {
+        return Ok(rollout_path);
+    }
+    if target_path.exists() {
+        return Err(format!(
+            "迁移 Codex 导入会话 {} 失败：目标文件已存在 {}",
+            thread_id,
+            target_path.display()
+        ));
+    }
+
+    let target_dir = target_path
+        .parent()
+        .ok_or_else(|| format!("无法确定 Codex 会话 {} 的目标目录", thread_id))?;
+    fs::create_dir_all(target_dir)
+        .map_err(|error| format!("创建 Codex 标准会话目录失败：{}", error))?;
+    fs::rename(&rollout_path, &target_path)
+        .map_err(|error| format!("迁移 Codex 导入会话文件失败：{}", error))?;
+
+    if let Err(error) = state.execute(
+        "UPDATE threads SET rollout_path = ?1 WHERE id = ?2 AND source = 'vscode'",
+        params![target_path.to_string_lossy(), thread_id],
+    ) {
+        let _ = fs::rename(&target_path, &rollout_path);
+        return Err(format!("更新 Codex 导入会话路径失败：{}", error));
+    }
+
+    Ok(target_path)
+}
+
+fn write_codex_app_server_message(stdin: &mut impl Write, message: &Value) -> Result<(), String> {
+    serde_json::to_writer(&mut *stdin, message).map_err(|error| error.to_string())?;
+    stdin.write_all(b"\n").map_err(|error| error.to_string())?;
+    stdin.flush().map_err(|error| error.to_string())
+}
+
+fn wait_for_codex_app_server_response(
+    receiver: &mpsc::Receiver<Value>,
+    request_id: i64,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + StdDuration::from_secs(12);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("Codex app-server 请求 {} 超时", request_id));
+        }
+
+        let message = receiver
+            .recv_timeout(remaining)
+            .map_err(|error| format!("等待 Codex app-server 响应失败：{}", error))?;
+        if message.get("id").and_then(Value::as_i64) != Some(request_id) {
+            continue;
+        }
+
+        if let Some(error) = message.get("error") {
+            let detail = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            return Err(detail.to_string());
+        }
+        return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+    }
+}
+
+fn codex_thread_archive_action_is_satisfied(
+    codex_dir: &Path,
+    action: &CodexThreadArchiveAction,
+) -> bool {
+    let Ok(state) = Connection::open(codex_dir.join("state_5.sqlite")) else {
+        return false;
+    };
+    let thread = state
+        .query_row(
+            "SELECT archived, rollout_path FROM threads WHERE id = ?1 AND source = 'vscode'",
+            [action.thread_id.as_str()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional();
+    let Ok(Some((archived, rollout_path))) = thread else {
+        return false;
+    };
+    let rollout_path = PathBuf::from(rollout_path);
+    let rollout_is_archived = rollout_path.starts_with(codex_dir.join("archived_sessions"));
+    let rollout_exists = rollout_path.exists();
+
+    match action.method {
+        "thread/archive" => archived != 0 && rollout_is_archived && rollout_exists,
+        "thread/unarchive" => archived == 0 && !rollout_is_archived && rollout_exists,
+        _ => false,
+    }
+}
+
+/// Use Codex's supported thread archive APIs instead of only toggling SQLite.
+/// The app-server moves rollout files between `sessions` and
+/// `archived_sessions`, which prevents the desktop app from rediscovering and
+/// unhiding another identity's threads during startup.
+fn apply_codex_thread_archive_actions(
+    codex_dir: &Path,
+    actions: &[CodexThreadArchiveAction],
+) -> Result<(), String> {
+    if actions.is_empty() || cfg!(test) {
+        return Ok(());
+    }
+
+    let codex_cli = resolve_codex_cli_path()?;
+    let mut child = Command::new(codex_cli)
+        .args(["app-server", "--stdio"])
+        .env("CODEX_HOME", codex_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("启动 Codex app-server 失败：{}", error))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法连接 Codex app-server 输入流".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法连接 Codex app-server 输出流".to_string())?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(message) = serde_json::from_str::<Value>(&line) {
+                if sender.send(message).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = (|| {
+        write_codex_app_server_message(
+            &mut stdin,
+            &json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "codex_switcher",
+                        "title": "Codex Switcher",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+        )?;
+        wait_for_codex_app_server_response(&receiver, 1)?;
+        write_codex_app_server_message(
+            &mut stdin,
+            &json!({ "method": "initialized", "params": {} }),
+        )?;
+
+        let mut action_errors = Vec::new();
+        for (index, action) in actions.iter().enumerate() {
+            let request_id = index as i64 + 2;
+            write_codex_app_server_message(
+                &mut stdin,
+                &json!({
+                    "method": action.method,
+                    "id": request_id,
+                    "params": { "threadId": action.thread_id }
+                }),
+            )?;
+            if let Err(error) = wait_for_codex_app_server_response(&receiver, request_id) {
+                // Codex may report a stale response after another process has
+                // already completed the move. Re-read the index before
+                // deciding that the action failed.
+                if codex_thread_archive_action_is_satisfied(codex_dir, action) {
+                    continue;
+                }
+
+                // The desktop process owns active thread writers. Identity
+                // switching restarts it and runs visibility sync again after
+                // those writers have stopped, so this is a retryable state.
+                if error.contains("already has an active writer") {
+                    continue;
+                }
+
+                action_errors.push(format!(
+                    "{} 会话 {} 失败：{}",
+                    if action.method == "thread/archive" {
+                        "归档"
+                    } else {
+                        "恢复"
+                    },
+                    action.thread_id,
+                    error
+                ));
+            }
+        }
+
+        if !action_errors.is_empty() {
+            return Err(action_errors.join("；"));
+        }
+        Ok(())
+    })();
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+/// Codex has one global `state_5.sqlite` and one active `config.toml`.  Keep
+/// only threads that can be resolved by the active identity visible in that
+/// shared index; otherwise Codex renders stale threads but cannot open them
+/// because their provider is absent from the current config.
+fn sync_codex_thread_visibility_for_owner(
+    connection: &Connection,
+    codex_dir: &Path,
+    owner: &SessionOwner,
+) -> Result<(), String> {
+    let state_path = codex_dir.join("state_5.sqlite");
+    if !state_path.exists() {
+        return Ok(());
+    }
+
+    let expected_provider = codex_model_provider_for_owner(connection, codex_dir, owner, false);
+    let visible_imported_ids = {
+        let mut stmt = connection
+            .prepare(
+                "SELECT external_session_id
+                 FROM session_records
+                 WHERE record_type = 'codex_imported'
+                   AND owner_profile_kind = ?1
+                   AND owner_profile_ref = ?2
+                   AND external_session_id IS NOT NULL
+                   AND TRIM(external_session_id) != ''",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![owner.profile_kind, owner.profile_ref], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    let legacy_provider = if owner.profile_kind == "third_party_key" {
+        let profile_id = owner
+            .profile_ref
+            .strip_prefix("key:")
+            .unwrap_or(&owner.profile_ref)
+            .parse::<i64>()
+            .ok();
+        profile_id.and_then(|profile_id| {
+            let profile = query_credential_profile_by_id(connection, profile_id).ok()?;
+            let same_provider_count = query_credential_profiles(connection)
+                .ok()?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.profile_kind == "third_party_key"
+                        && candidate
+                            .provider
+                            .trim()
+                            .eq_ignore_ascii_case(profile.provider.trim())
+                })
+                .count();
+            (same_provider_count == 1).then(|| profile.provider.trim().to_string())
+        })
+    } else {
+        None
+    };
+
+    let state = Connection::open(&state_path)
+        .map_err(|error| format!("更新 Codex thread 可见性失败：{}", error))?;
+    state
+        .busy_timeout(StdDuration::from_secs(5))
+        .map_err(|error| format!("等待 Codex thread 数据库失败：{}", error))?;
+    let mut stmt = state
+        .prepare(
+            "SELECT id, model_provider, archived, rollout_path, created_at
+             FROM threads WHERE source = 'vscode'",
+        )
+        .map_err(|error| error.to_string())?;
+    let threads = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(stmt);
+
+    let archived_sessions_dir = codex_dir.join("archived_sessions");
+    let mut archive_actions = Vec::new();
+    for (thread_id, model_provider, archived, rollout_path, created_at) in threads {
+        let is_current_official = owner.profile_kind == "official_account"
+            && is_official_codex_model_provider(&model_provider);
+        let is_current_key = expected_provider.as_deref() == Some(model_provider.as_str())
+            || visible_imported_ids.contains(&thread_id);
+        let is_unambiguous_legacy_key = legacy_provider.as_deref() == Some(model_provider.trim());
+        let visible = is_current_official || is_current_key || is_unambiguous_legacy_key;
+
+        let rollout_path = migrate_legacy_imported_rollout_path(
+            &state,
+            codex_dir,
+            &thread_id,
+            created_at,
+            PathBuf::from(rollout_path),
+        )?;
+        let rollout_exists = rollout_path.exists();
+        let rollout_is_archived = rollout_path.starts_with(&archived_sessions_dir);
+
+        if visible {
+            if let Some(expected_provider) = expected_provider.as_deref() {
+                if owner.profile_kind == "third_party_key"
+                    && (visible_imported_ids.contains(&thread_id) || is_unambiguous_legacy_key)
+                    && model_provider != expected_provider
+                {
+                    state
+                        .execute(
+                            "UPDATE threads
+                             SET model_provider = ?1
+                             WHERE id = ?2 AND source = 'vscode'",
+                            params![expected_provider, thread_id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+
+            if !rollout_exists {
+                // A stale index row without its rollout cannot be opened. Do
+                // not surface it merely because its provider matches the
+                // active identity; that recreates the disabled sidebar rows
+                // this visibility sync is intended to remove.
+                state
+                    .execute(
+                        "UPDATE threads
+                         SET archived = 1,
+                             archived_at = CASE WHEN archived = 0 THEN strftime('%s', 'now') ELSE archived_at END
+                         WHERE id = ?1 AND source = 'vscode'",
+                        [thread_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            } else if rollout_is_archived {
+                archive_actions.push(CodexThreadArchiveAction {
+                    thread_id,
+                    method: "thread/unarchive",
+                });
+            } else {
+                state
+                    .execute(
+                        "UPDATE threads SET archived = 0, archived_at = NULL
+                         WHERE id = ?1 AND source = 'vscode'",
+                        [thread_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        } else {
+            if rollout_exists && !rollout_is_archived {
+                // Call the supported Codex archive API even when an older
+                // Switcher build already set archived=1 directly. The file
+                // must also leave `sessions`, otherwise paginated history is
+                // rediscovered during the next desktop startup.
+                archive_actions.push(CodexThreadArchiveAction {
+                    thread_id,
+                    method: "thread/archive",
+                });
+            } else if archived == 0 || rollout_is_archived || !rollout_exists {
+                state
+                    .execute(
+                        "UPDATE threads
+                         SET archived = 1,
+                             archived_at = CASE WHEN archived = 0 THEN strftime('%s', 'now') ELSE archived_at END
+                         WHERE id = ?1 AND source = 'vscode'",
+                        [thread_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+
+    drop(state);
+    apply_codex_thread_archive_actions(codex_dir, &archive_actions)
+}
+
+fn sync_codex_thread_visibility_for_active_owner(connection: &Connection) -> Result<(), String> {
+    let Some(owner) = current_active_session_owner(connection)? else {
+        return Ok(());
+    };
+    let codex_dir = codex_config_dir()?;
+    sync_codex_thread_visibility_for_owner(connection, &codex_dir, &owner)
+}
+
+#[cfg(target_os = "macos")]
+fn codex_desktop_app_is_running() -> bool {
+    Command::new("pgrep")
+        .args(["-x", "ChatGPT"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn codex_desktop_app_is_running() -> bool {
+    false
+}
+
+/// Codex keeps the active provider and sidebar thread list in process memory.
+/// Reload it after an identity change so the newly written config and archived
+/// flags take effect together. The delay lets the Tauri invoke return first.
+fn schedule_codex_desktop_reload_if_running(app: &tauri::AppHandle) {
+    if cfg!(test) || !codex_desktop_app_is_running() {
+        return;
+    }
+
+    let app_handle = app.clone();
+    thread::spawn(move || {
+        thread::sleep(StdDuration::from_millis(700));
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("osascript")
+                .args(["-e", "tell application id \"com.openai.codex\" to quit"])
+                .status();
+
+            for _ in 0..20 {
+                if !codex_desktop_app_is_running() {
+                    break;
+                }
+                thread::sleep(StdDuration::from_millis(250));
+            }
+
+            if codex_desktop_app_is_running() {
+                let _ = Command::new("pkill")
+                    .args(["-TERM", "-x", "ChatGPT"])
+                    .status();
+                thread::sleep(StdDuration::from_millis(500));
+            }
+
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                if let Ok(connection) = state.db.lock() {
+                    let _ = sync_codex_thread_visibility_for_active_owner(&connection);
+                }
+            }
+
+            let _ = Command::new("open")
+                .args(["-b", "com.openai.codex"])
+                .status();
+        }
+    });
 }
 
 fn import_codex_local_sessions_from_dir(
@@ -7068,6 +7585,7 @@ fn create_key_profile(
 fn update_key_profile(
     input: UpdateKeyProfileInput,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<CredentialProfile, String> {
     let api_key = input
         .api_key
@@ -7109,6 +7627,13 @@ fn update_key_profile(
     drop(connection);
     if profile.is_active {
         apply_key_profile_runtime_config(&profile)?;
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| "数据库锁获取失败".to_string())?;
+        sync_codex_thread_visibility_for_active_owner(&connection)?;
+        drop(connection);
+        schedule_codex_desktop_reload_if_running(&app);
     }
     Ok(profile)
 }
@@ -7117,6 +7642,7 @@ fn update_key_profile(
 fn activate_credential_profile(
     profile_id: i64,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<CredentialProfile, String> {
     let connection = state
         .db
@@ -7141,6 +7667,13 @@ fn activate_credential_profile(
         }
         _ => {}
     }
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| "数据库锁获取失败".to_string())?;
+    sync_codex_thread_visibility_for_active_owner(&connection)?;
+    drop(connection);
+    schedule_codex_desktop_reload_if_running(&app);
     Ok(profile)
 }
 
@@ -7645,6 +8178,7 @@ fn switch_account(
     if target_account.is_real_session {
         activate_account_credential_profile_record(&connection, target_account_id)?;
     }
+    sync_codex_thread_visibility_for_active_owner(&connection)?;
 
     insert_switch_log(
         &connection,
@@ -7669,6 +8203,7 @@ fn switch_account(
     drop(connection);
     let _ = apply_tray_presentation(&app, &presentation);
     enqueue_post_switch_sampling(&app, target_account_id);
+    schedule_codex_desktop_reload_if_running(&app);
     Ok(overview)
 }
 
@@ -7703,6 +8238,7 @@ fn list_sessions_for_profile(
     backfill_codex_imported_session_titles(&connection)?;
     backfill_codex_imported_session_owners(&connection)?;
     backfill_codex_imported_state_model_providers(&connection)?;
+    sync_codex_thread_visibility_for_active_owner(&connection)?;
     let mut stmt = connection
         .prepare(
             "SELECT DISTINCT s.id, s.project_id, p.name, p.workspace_path, s.owner_account_id,
@@ -9471,8 +10007,8 @@ mod tests {
         let config_toml = fs::read_to_string(config_dir.join("config.toml")).expect("read config");
 
         assert!(auth_json.contains("\"OPENAI_API_KEY\":\"example-api-key-1234567890abcdef\""));
-        assert!(config_toml.contains("model_provider = \"yuchat\""));
-        assert!(config_toml.contains("[model_providers.\"yuchat\"]"));
+        assert!(config_toml.contains("model_provider = \"codexswitcher-key-1\""));
+        assert!(config_toml.contains("[model_providers.\"codexswitcher-key-1\"]"));
         assert!(config_toml.contains("name = \"yuchat\""));
         assert!(config_toml.contains("model = \"gpt-5-codex\""));
         assert!(config_toml.contains("base_url = \"https://sub2api.yuchat.top/v1\""));
@@ -10188,7 +10724,7 @@ mod tests {
     }
 
     #[test]
-    fn importing_official_thread_into_active_key_writes_configured_provider() {
+    fn importing_official_thread_into_active_key_writes_key_scoped_provider() {
         let connection = setup_test_connection();
         let key_profile = create_key_profile_record(
             &connection,
@@ -10259,7 +10795,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query model provider");
-        assert_eq!(model_provider, "renamed-provider");
+        assert_eq!(
+            model_provider,
+            format!("codexswitcher-key-{}", key_profile.id)
+        );
 
         let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
         let first_line = rollout_content.lines().next().expect("rollout meta line");
@@ -10268,8 +10807,123 @@ mod tests {
             meta.get("payload")
                 .and_then(|payload| payload.get("model_provider"))
                 .and_then(Value::as_str),
-            Some("renamed-provider")
+            Some(format!("codexswitcher-key-{}", key_profile.id).as_str())
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_identity_visibility_hides_threads_owned_by_other_keys() {
+        let connection = setup_test_connection();
+        let first_key = create_key_profile_record(
+            &connection,
+            CreateKeyProfileInput {
+                provider: "taomu".to_string(),
+                nickname: "桃木 Key A".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                model: "gpt-5-codex".to_string(),
+                api_key: "example-api-key-1234567890abcdef".to_string(),
+            },
+            "keychain://visibility-key-a",
+        )
+        .expect("create first key");
+        let second_key = create_key_profile_record(
+            &connection,
+            CreateKeyProfileInput {
+                provider: "taomu".to_string(),
+                nickname: "桃木 Key B".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                model: "gpt-5-codex".to_string(),
+                api_key: "example-api-key-abcdef1234567890".to_string(),
+            },
+            "keychain://visibility-key-b",
+        )
+        .expect("create second key");
+
+        let root = std::env::temp_dir().join(format!(
+            "codexswitcher-thread-visibility-test-{}-{}",
+            std::process::id(),
+            now_text().replace([' ', ':'], "-")
+        ));
+        let state = create_codex_state_db(&root);
+        for (id, provider) in [
+            ("key-a-thread", key_profile_model_provider(&first_key)),
+            ("key-b-thread", key_profile_model_provider(&second_key)),
+            ("official-thread", "openai".to_string()),
+            (
+                "missing-key-a-thread",
+                key_profile_model_provider(&first_key),
+            ),
+        ] {
+            let rollout_path = root.join(format!("{id}.jsonl"));
+            if id == "key-a-thread" {
+                fs::write(&rollout_path, "{}\n").expect("write visibility rollout");
+            }
+            state
+                .execute(
+                    "INSERT INTO threads
+                        (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                         sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
+                         cli_version, first_user_message, memory_mode)
+                     VALUES (?1, ?2, 1777176000, 1777176060, 'vscode', ?3, '/tmp/project', ?1,
+                             'workspace-write', 'on-request', 0, 1, 0, 'test', '', 'enabled')",
+                    params![id, rollout_path.to_string_lossy(), provider],
+                )
+                .expect("insert state thread");
+        }
+        drop(state);
+
+        let first_owner = SessionOwner {
+            account_id: None,
+            profile_kind: "third_party_key".to_string(),
+            profile_ref: format!("key:{}", first_key.id),
+        };
+        sync_codex_thread_visibility_for_owner(&connection, &root, &first_owner)
+            .expect("show first key only");
+
+        let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
+        let archived = |id: &str| {
+            state
+                .query_row("SELECT archived FROM threads WHERE id = ?1", [id], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("read archived state")
+        };
+        assert_eq!(archived("key-a-thread"), 0);
+        assert_eq!(archived("key-b-thread"), 1);
+        assert_eq!(archived("official-thread"), 1);
+        assert_eq!(archived("missing-key-a-thread"), 1);
+        drop(state);
+
+        let official_owner = SessionOwner {
+            account_id: Some(1),
+            profile_kind: "official_account".to_string(),
+            profile_ref: "account:1".to_string(),
+        };
+        fs::remove_file(root.join("key-a-thread.jsonl"))
+            .expect("hide first key rollout in test mode");
+        fs::write(root.join("official-thread.jsonl"), "{}\n")
+            .expect("restore official visibility rollout");
+        sync_codex_thread_visibility_for_owner(&connection, &root, &official_owner)
+            .expect("show official threads only");
+        let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
+        let key_a_archived: i64 = state
+            .query_row(
+                "SELECT archived FROM threads WHERE id = 'key-a-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read key archived state");
+        let official_archived: i64 = state
+            .query_row(
+                "SELECT archived FROM threads WHERE id = 'official-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read official archived state");
+        assert_eq!(key_a_archived, 1);
+        assert_eq!(official_archived, 0);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -10364,7 +11018,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query model provider");
-        assert_eq!(model_provider, "oneTop");
+        assert_eq!(
+            model_provider,
+            format!("codexswitcher-key-{}", key_profile.id)
+        );
 
         let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
         let first_line = rollout_content.lines().next().expect("rollout meta line");
@@ -10373,7 +11030,7 @@ mod tests {
             meta.get("payload")
                 .and_then(|payload| payload.get("model_provider"))
                 .and_then(Value::as_str),
-            Some("oneTop")
+            Some(format!("codexswitcher-key-{}", key_profile.id).as_str())
         );
 
         let _ = fs::remove_dir_all(root);
@@ -10620,8 +11277,20 @@ mod tests {
             )
             .expect("query copied thread");
         assert_eq!(original_provider, "custom");
-        assert_eq!(copied_provider, "oneTop");
+        assert_eq!(
+            copied_provider,
+            format!("codexswitcher-key-{}", one_top_profile.id)
+        );
         assert_ne!(copied_rollout, rollout_path.to_string_lossy());
+        let copied_rollout = PathBuf::from(copied_rollout);
+        assert!(copied_rollout.starts_with(root.join("sessions")));
+        assert!(!copied_rollout
+            .to_string_lossy()
+            .contains("codexswitcher-imported"));
+        assert!(copied_rollout
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(&copied_session_id)));
         let copied_content = fs::read_to_string(copied_rollout).expect("read copied rollout");
         let copied_meta: Value =
             serde_json::from_str(copied_content.lines().next().expect("copied rollout meta"))
@@ -10638,7 +11307,7 @@ mod tests {
                 .get("payload")
                 .and_then(|payload| payload.get("model_provider"))
                 .and_then(Value::as_str),
-            Some("oneTop")
+            Some(format!("codexswitcher-key-{}", one_top_profile.id).as_str())
         );
 
         let _ = fs::remove_dir_all(root);
@@ -11641,6 +12310,10 @@ pub fn run() {
             let db_path = app_dir.join("codexswitcher-mac.db");
             let connection = Connection::open(db_path).map_err(|error| error.to_string())?;
             init_database(&connection)?;
+            let _ = reconcile_runtime_active_identity(&connection);
+            let _ = ensure_one_active(&connection);
+            let _ = backfill_codex_imported_state_model_providers(&connection);
+            let _ = sync_codex_thread_visibility_for_active_owner(&connection);
             app.manage(AppState {
                 db: Mutex::new(connection),
                 sampling_in_progress: AtomicBool::new(false),

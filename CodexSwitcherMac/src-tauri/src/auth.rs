@@ -116,6 +116,9 @@ fn codex_cli_candidates() -> Vec<PathBuf> {
     candidates.push(PathBuf::from(
         "/Applications/Codex.app/Contents/Resources/codex",
     ));
+    candidates.push(PathBuf::from(
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+    ));
     candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
     candidates.push(PathBuf::from("/usr/local/bin/codex"));
     candidates.push(PathBuf::from("codex"));
