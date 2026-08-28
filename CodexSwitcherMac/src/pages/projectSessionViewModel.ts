@@ -1,4 +1,4 @@
-import type { LocalProject, SessionRecord } from "../types";
+import type { CodexLocalSessionCandidate, LocalProject, SessionRecord } from "../types";
 import type { IdentityAsset } from "./identityViewModel";
 
 export type ProjectSessionSelection =
@@ -97,6 +97,14 @@ function identityLabel(key: string, assets: IdentityAsset[]) {
       label: "本地 Codex 导入",
       subtitle: "未绑定账号/Key",
       kindLabel: "未绑定",
+    };
+  }
+  if (key.startsWith("account:") || key.startsWith("key:")) {
+    const kindLabel = key.startsWith("account:") ? "官方账号" : "Key";
+    return {
+      label: `历史${kindLabel}（ID ${key.split(":")[1]}）`,
+      subtitle: "原身份已移除，名称不可用",
+      kindLabel,
     };
   }
   return {
@@ -208,4 +216,115 @@ export function selectedProjectSessionTitle(selection: ProjectSessionSelection, 
   if (selection.kind === "project") return project.name;
   const session = project.sessions.find((item) => item.id === selection.sessionId);
   return session ? displaySessionTitle(session) : "项目会话";
+}
+
+function stableNegativeId(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+  return -Math.abs(hash || 1);
+}
+
+function sessionExternalId(record: SessionRecord) {
+  try {
+    const content = JSON.parse(record.raw_content) as { session_id?: unknown };
+    return typeof content.session_id === "string" ? content.session_id : null;
+  } catch {
+    return null;
+  }
+}
+
+// Only the active identity belongs in the destination library.
+export function buildProjectSessionRecords({
+  activeIdentity,
+  localProjects,
+  sessionRecords,
+  candidates,
+}: {
+  activeIdentity: IdentityAsset | null;
+  localProjects: LocalProject[];
+  sessionRecords: SessionRecord[];
+  candidates: CodexLocalSessionCandidate[];
+}): SessionRecord[] {
+  if (!activeIdentity) return [];
+  const records = sessionRecords.filter((record) => sessionIdentityKey(record) === activeIdentity.id);
+  const existingExternalIds = new Set(sessionRecords.map(sessionExternalId).filter(Boolean));
+  const projectIdByPath = new Map(localProjects.map((project) => [project.workspace_path, project.id]));
+  for (const candidate of candidates) {
+    if (candidate.identity_key !== activeIdentity.id || existingExternalIds.has(candidate.candidate_id)) continue;
+    const identity = activeIdentity;
+    existingExternalIds.add(candidate.candidate_id);
+    records.push({
+      id: stableNegativeId(`session:${candidate.candidate_id}`),
+      project_id: projectIdByPath.get(candidate.project_path) ?? stableNegativeId(`project:${candidate.project_path}`),
+      project_name: candidate.project_name,
+      project_path: candidate.project_path,
+      owner_account_id: identity.account?.id ?? null,
+      owner_profile_kind: identity.kind,
+      owner_profile_ref: identity.id,
+      record_type: "codex_local_thread",
+      title: candidate.title,
+      summary: `Codex 本地会话 · ${candidate.message_count} 条消息 · ${candidate.project_path}`,
+      raw_content: JSON.stringify({ source: "codex_state_thread", session_id: candidate.candidate_id, source_path: candidate.source_path }),
+      message_count: candidate.message_count,
+      source_record_id: null,
+      created_at: candidate.created_at,
+      updated_at: candidate.updated_at,
+    });
+  }
+  return records;
+}
+
+export type ProjectSessionImportCandidate = CodexLocalSessionCandidate & { importable: boolean };
+
+// Preserve other identities' history in the source pane, but only enable real import sources.
+export function buildProjectSessionImportCandidates({
+  activeIdentityKey,
+  identityAssets,
+  sessionRecords,
+  candidates,
+}: {
+  activeIdentityKey: string | null;
+  identityAssets: IdentityAsset[];
+  sessionRecords: SessionRecord[];
+  candidates: CodexLocalSessionCandidate[];
+}): ProjectSessionImportCandidate[] {
+  const currentIds = new Set(sessionRecords
+    .filter((record) => sessionIdentityKey(record) === activeIdentityKey)
+    .map(sessionExternalId).filter(Boolean));
+  const byId = new Map<string, ProjectSessionImportCandidate>();
+  const sourceById = new Map(candidates.map((candidate) => [candidate.candidate_id, candidate]));
+  for (const record of sessionRecords) {
+    const key = sessionIdentityKey(record);
+    const externalId = sessionExternalId(record);
+    if (key === activeIdentityKey || (externalId && currentIds.has(externalId))) continue;
+    const source = externalId ? sourceById.get(externalId) : undefined;
+    const label = identityLabel(key, identityAssets);
+    const id = externalId ?? `record:${record.id}`;
+    if (byId.has(id)) continue;
+    byId.set(id, {
+      candidate_id: id,
+      identity_key: key,
+      identity_label: label.label,
+      identity_kind_label: label.kindLabel,
+      project_name: record.project_name,
+      project_path: record.project_path,
+      title: displaySessionTitle(record),
+      message_count: source?.message_count ?? record.message_count,
+      source_path: source?.source_path ?? "",
+      created_at: record.created_at,
+      updated_at: source?.updated_at ?? record.updated_at,
+      imported_session_id: record.id,
+      imported_owner_profile_kind: record.owner_profile_kind,
+      imported_owner_profile_ref: record.owner_profile_ref,
+      importable: Boolean(source),
+    });
+  }
+  for (const candidate of candidates) {
+    if (candidate.identity_key === activeIdentityKey || currentIds.has(candidate.candidate_id)
+      || byId.has(candidate.candidate_id)) continue;
+    byId.set(candidate.candidate_id, { ...candidate, importable: true });
+  }
+  return [...byId.values()].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
 }

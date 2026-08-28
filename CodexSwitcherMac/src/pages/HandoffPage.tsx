@@ -4,12 +4,13 @@ import type { CodexLocalSessionCandidate, LocalProject, SessionRecord } from "..
 import type { IdentityAsset } from "./identityViewModel";
 import {
   buildProjectSessionGroups,
+  buildProjectSessionRecords,
+  buildProjectSessionImportCandidates,
   displaySessionTitle,
   selectedProjectSessionTitle,
-  sessionIdentityKey,
   sessionsForProjectSelection,
 } from "./projectSessionViewModel";
-import type { ProjectSessionSelection } from "./projectSessionViewModel";
+import type { ProjectSessionSelection, ProjectSessionImportCandidate } from "./projectSessionViewModel";
 
 type ProjectSessionsPageProps = {
   identityAssets: IdentityAsset[];
@@ -43,47 +44,6 @@ function sessionTitle(record: SessionRecord) {
   return displaySessionTitle(record);
 }
 
-function stableNegativeId(value: string) {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash * 31 + value.charCodeAt(index)) | 0;
-  }
-  return -Math.abs(hash || 1);
-}
-
-function sessionExternalId(record: SessionRecord) {
-  try {
-    const content = JSON.parse(record.raw_content) as { session_id?: unknown };
-    return typeof content.session_id === "string" ? content.session_id : null;
-  } catch {
-    return null;
-  }
-}
-
-function candidateAsSessionRecord(
-  candidate: CodexLocalSessionCandidate,
-  activeIdentity: IdentityAsset,
-  projectId: number,
-): SessionRecord {
-  return {
-    id: stableNegativeId(`session:${candidate.candidate_id}`),
-    project_id: projectId,
-    project_name: candidate.project_name,
-    project_path: candidate.project_path,
-    owner_account_id: activeIdentity.account?.id ?? null,
-    owner_profile_kind: activeIdentity.kind,
-    owner_profile_ref: activeIdentity.id,
-    record_type: "codex_local_thread",
-    title: candidate.title,
-    summary: `Codex 本地会话 · ${candidate.message_count} 条消息 · ${candidate.project_path}`,
-    raw_content: JSON.stringify({ source: "codex_state_thread", session_id: candidate.candidate_id, source_path: candidate.source_path }),
-    message_count: candidate.message_count,
-    source_record_id: null,
-    created_at: candidate.created_at,
-    updated_at: candidate.updated_at,
-  };
-}
-
 export function HandoffPage({
   identityAssets,
   activeIdentity,
@@ -104,41 +64,18 @@ export function HandoffPage({
     }
     return [...byId.values()].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
   }, [codexLocalSessionCandidates]);
-  const currentIdentityRecords = useMemo(
-    () => {
-      if (!activeIdentityKey || !activeIdentity) return [];
-      const records = sessionRecords.filter((record) => sessionIdentityKey(record) === activeIdentityKey);
-      const existingExternalIds = new Set(records.map(sessionExternalId).filter(Boolean));
-      const projectIdByPath = new Map(localProjects.map((project) => [project.workspace_path, project.id]));
-      const currentLocalThreads = uniqueCodexLocalSessionCandidates
-        .filter((candidate) => candidate.identity_key === activeIdentityKey && !existingExternalIds.has(candidate.candidate_id))
-        .map((candidate) => candidateAsSessionRecord(
-          candidate,
-          activeIdentity,
-          projectIdByPath.get(candidate.project_path) ?? stableNegativeId(`project:${candidate.project_path}`),
-        ));
-      return [...records, ...currentLocalThreads];
-    },
-    [activeIdentity, activeIdentityKey, localProjects, sessionRecords, uniqueCodexLocalSessionCandidates],
+  const libraryRecords = useMemo(
+    () => buildProjectSessionRecords({
+      activeIdentity,
+      localProjects,
+      sessionRecords,
+      candidates: uniqueCodexLocalSessionCandidates,
+    }),
+    [activeIdentity, localProjects, sessionRecords, uniqueCodexLocalSessionCandidates],
   );
-  const currentIdentityProjects = useMemo(() => {
-    const byPath = new Map(localProjects.map((project) => [project.workspace_path, project]));
-    const virtualProjects = currentIdentityRecords
-      .filter((record) => !byPath.has(record.project_path))
-      .map((record) => ({
-        id: record.project_id,
-        name: record.project_name,
-        workspace_path: record.project_path,
-        git_remote: null,
-        last_active_at: record.updated_at,
-        created_at: record.created_at,
-        updated_at: record.updated_at,
-      }));
-    return [...localProjects, ...virtualProjects];
-  }, [currentIdentityRecords, localProjects]);
   const groups = useMemo(
-    () => buildProjectSessionGroups({ identityAssets, localProjects: currentIdentityProjects, sessionRecords: currentIdentityRecords }),
-    [currentIdentityProjects, currentIdentityRecords, identityAssets],
+    () => buildProjectSessionGroups({ identityAssets, localProjects, sessionRecords: libraryRecords }),
+    [localProjects, libraryRecords, identityAssets],
   );
   const [selection, setSelection] = useState<ProjectSessionSelection>({ kind: "all" });
   const [expandedIdentities, setExpandedIdentities] = useState<Set<string>>(() => new Set());
@@ -161,7 +98,7 @@ export function HandoffPage({
   }, [groups]);
 
   const projectCount = groups.reduce((total, group) => total + group.projectCount, 0);
-  const sessionCount = currentIdentityRecords.length;
+  const sessionCount = libraryRecords.length;
   const projectCountText = `${projectCount}`;
   const sessionCountText = `${sessionCount}`;
   const selectedSessions = useMemo(
@@ -170,11 +107,13 @@ export function HandoffPage({
   );
   const selectedTitle = selectedProjectSessionTitle(selection, groups);
   const importCandidates = useMemo(
-    () => uniqueCodexLocalSessionCandidates.filter((candidate) => candidate.identity_key !== activeIdentityKey),
-    [activeIdentityKey, uniqueCodexLocalSessionCandidates],
+    () => buildProjectSessionImportCandidates({
+      activeIdentityKey, identityAssets, sessionRecords, candidates: uniqueCodexLocalSessionCandidates,
+    }),
+    [activeIdentityKey, identityAssets, sessionRecords, uniqueCodexLocalSessionCandidates],
   );
   const importCandidateIdentities = useMemo(() => {
-    const grouped = new Map<string, CodexLocalSessionCandidate[]>();
+    const grouped = new Map<string, ProjectSessionImportCandidate[]>();
     for (const candidate of importCandidates) {
       const sessions = grouped.get(candidate.identity_key) ?? [];
       sessions.push(candidate);
@@ -182,7 +121,7 @@ export function HandoffPage({
     }
     return [...grouped.entries()]
       .map(([identityKey, sessions]) => {
-        const projectGroups = new Map<string, CodexLocalSessionCandidate[]>();
+        const projectGroups = new Map<string, ProjectSessionImportCandidate[]>();
         for (const session of sessions) {
           const projectSessions = projectGroups.get(session.project_path) ?? [];
           projectSessions.push(session);
@@ -198,7 +137,8 @@ export function HandoffPage({
           .sort((left, right) => right.sessions[0].updated_at.localeCompare(left.sessions[0].updated_at));
         return {
           identityKey,
-          identityLabel: sessions[0]?.identity_label ?? identityKey,
+          identityLabel: identityAssets.find((asset) => asset.id === identityKey)?.title
+            ?? sessions[0]?.identity_label ?? identityKey,
           identityKindLabel: sessions[0]?.identity_kind_label ?? "其他",
           sessionCount: sessions.length,
           projectCount: projects.length,
@@ -207,23 +147,28 @@ export function HandoffPage({
         };
       })
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  }, [importCandidates]);
+  }, [identityAssets, importCandidates]);
   useEffect(() => {
     const identityKeys = new Set(importCandidateIdentities.map((group) => group.identityKey));
     const projectKeys = new Set(
       importCandidateIdentities.flatMap((group) => group.projects.map((project) => project.key)),
     );
-    const candidateIds = new Set(importCandidates.map((candidate) => candidate.candidate_id));
+    const candidateIds = new Set(importCandidates.filter((candidate) => candidate.importable).map((candidate) => candidate.candidate_id));
     setExpandedImportIdentities((current) => new Set([...current].filter((key) => identityKeys.has(key))));
     setExpandedImportProjects((current) => new Set([...current].filter((key) => projectKeys.has(key))));
     setSelectedCandidateIds((current) => new Set([...current].filter((key) => candidateIds.has(key))));
   }, [importCandidateIdentities, importCandidates]);
+  useEffect(() => {
+    setSelection({ kind: "all" });
+    setSelectedCandidateIds(new Set());
+  }, [activeIdentityKey]);
   const selectedCandidateCount = selectedCandidateIds.size;
   const activeIdentityLabel = activeIdentity
     ? `${activeIdentity.kind === "third_party_key" ? "Key" : "官方账号"} · ${activeIdentity.title}`
     : "未设置当前身份";
 
   function toggleCandidate(candidateId: string) {
+    if (!importCandidates.some((candidate) => candidate.candidate_id === candidateId && candidate.importable)) return;
     setSelectedCandidateIds((current) => {
       const next = new Set(current);
       if (next.has(candidateId)) next.delete(candidateId);
@@ -232,7 +177,8 @@ export function HandoffPage({
     });
   }
 
-  function toggleProjectCandidates(candidates: CodexLocalSessionCandidate[]) {
+  function toggleProjectCandidates(items: ProjectSessionImportCandidate[]) {
+    const candidates = items.filter((candidate) => candidate.importable);
     setSelectedCandidateIds((current) => {
       const next = new Set(current);
       const allSelected = candidates.every((candidate) => next.has(candidate.candidate_id));
@@ -244,7 +190,7 @@ export function HandoffPage({
     });
   }
 
-  function toggleImportIdentityCandidates(candidates: CodexLocalSessionCandidate[]) {
+  function toggleImportIdentityCandidates(candidates: ProjectSessionImportCandidate[]) {
     toggleProjectCandidates(candidates);
   }
 
@@ -264,8 +210,8 @@ export function HandoffPage({
       <article className="workspace-card handoff-workspace__editor project-session-tree-card">
         <SectionHeader
           eyebrow="本地项目"
-          title="项目记录库"
-          description={`当前身份：${activeIdentityLabel}。这里只显示当前登录账号或 Key 已导入的项目会话。`}
+          title="当前账号 / Key 会话"
+          description={`当前身份：${activeIdentityLabel}。这里只显示当前身份的会话，可从右侧选择其他账号 / Key 的会话导入。`}
         />
         <div className="metric-grid compact-metric-grid project-session-metrics">
           <div className="metric-tile">
@@ -283,8 +229,8 @@ export function HandoffPage({
             type="button"
             onClick={() => setSelection({ kind: "all" })}
           >
-            <span>全部身份</span>
-            <strong>{groups.length} 类身份 · {sessionCount} 个会话</strong>
+            <span>当前身份的全部项目</span>
+            <strong>{projectCount} 个项目 · {sessionCount} 个会话</strong>
           </button>
           {groups.length ? groups.map((identity) => {
             const identityOpen = expandedIdentities.has(identity.key);
@@ -381,23 +327,23 @@ export function HandoffPage({
           }) : (
             <div className="workspace-empty-state">
               <strong>暂无会话记录</strong>
-              <p>导入真实 Codex 本地 session 后，会按身份和项目出现在这里。</p>
+              <p>当前账号 / Key 暂无会话，可从右侧选择其他身份的会话导入。</p>
             </div>
           )}
         </div>
         {selectedSessions.length ? (
           <div className="project-session-current-preview">
             <strong>{selectedTitle}</strong>
-            <span>{selectedSessions.length} 条当前身份会话</span>
+            <span>{selectedSessions.length} 条会话</span>
           </div>
         ) : null}
       </article>
 
       <article className="workspace-card handoff-workspace__history">
         <SectionHeader
-          eyebrow="本地会话"
+          eyebrow="其他账号 / Key 会话"
           title="待导入会话"
-          description={`从这里选择其他身份或本地 Codex 候选会话，导入到 ${activeIdentityLabel} 的项目记录库。`}
+          description={`按账号 / Key 查看其他身份的会话，选中后导入到左侧 ${activeIdentityLabel}。未找到可导入源会话的历史记录仅供查看。`}
           actions={
             <button
               className="btn btn-primary"
@@ -412,7 +358,8 @@ export function HandoffPage({
         <div className="project-session-detail-list project-session-import-list">
           {importCandidateIdentities.length ? importCandidateIdentities.map((identity) => {
             const identitySessions = identity.projects.flatMap((project) => project.sessions);
-            const identitySelected = identitySessions.every((candidate) => selectedCandidateIds.has(candidate.candidate_id));
+            const availableIdentitySessions = identitySessions.filter((candidate) => candidate.importable);
+            const identitySelected = availableIdentitySessions.length > 0 && availableIdentitySessions.every((candidate) => selectedCandidateIds.has(candidate.candidate_id));
             const identityOpen = expandedImportIdentities.has(identity.identityKey);
             return (
               <article className="project-session-import-identity" key={identity.identityKey}>
@@ -445,19 +392,21 @@ export function HandoffPage({
                     <input
                       type="checkbox"
                       checked={identitySelected}
+                      disabled={availableIdentitySessions.length === 0}
                       onClick={handleCheckboxClick}
                       onChange={() => toggleImportIdentityCandidates(identitySessions)}
                     />
                     <span>
                       <strong>{identity.identityKindLabel} · {identity.identityLabel}</strong>
-                      <small>{identity.projectCount} 个项目 · {identity.sessionCount} 个可导入会话</small>
+                      <small>{identity.projectCount} 个项目 · {identity.sessionCount} 个会话 · {availableIdentitySessions.length} 个可导入</small>
                     </span>
                   </div>
                 </div>
                 {identityOpen ? (
                   <div className="project-session-import-projects">
                     {identity.projects.map((project) => {
-                      const projectSelected = project.sessions.every((candidate) => selectedCandidateIds.has(candidate.candidate_id));
+                      const availableProjectSessions = project.sessions.filter((candidate) => candidate.importable);
+                      const projectSelected = availableProjectSessions.length > 0 && availableProjectSessions.every((candidate) => selectedCandidateIds.has(candidate.candidate_id));
                       const projectOpen = expandedImportProjects.has(project.key);
                       return (
                         <article className="project-session-import-project" key={project.key}>
@@ -490,6 +439,7 @@ export function HandoffPage({
                               <input
                                 type="checkbox"
                                 checked={projectSelected}
+                                disabled={availableProjectSessions.length === 0}
                                 onClick={handleCheckboxClick}
                                 onChange={() => toggleProjectCandidates(project.sessions)}
                               />
@@ -518,6 +468,7 @@ export function HandoffPage({
                                   <input
                                     type="checkbox"
                                     checked={selectedCandidateIds.has(candidate.candidate_id)}
+                                    disabled={!candidate.importable}
                                     onClick={handleCheckboxClick}
                                     onChange={() => toggleCandidate(candidate.candidate_id)}
                                   />
@@ -527,7 +478,7 @@ export function HandoffPage({
                                       {candidate.message_count} 条消息 · {candidate.updated_at}
                                     </span>
                                   </span>
-                                  <span className="status-tag neutral">codex_local</span>
+                                  <span className="status-tag neutral">{candidate.importable ? "可导入" : "未找到可导入源会话"}</span>
                                 </div>
                               ))}
                             </div>

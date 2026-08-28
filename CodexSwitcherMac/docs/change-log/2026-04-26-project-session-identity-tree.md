@@ -1,5 +1,8 @@
 # Project Session Identity Tree Change Log
 
+> 2026-08-28: Current-identity-left / other-identities-right behavior is preserved.
+> See [the archive candidate and source-pane fix](2026-08-28-project-session-library-visibility.md).
+
 - Date: 2026-04-26
 - Type: Backend candidate source, UI behavior, and frontend view-model change
 

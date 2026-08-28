@@ -26,16 +26,18 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
-        mpsc, Mutex,
+        Mutex,
     },
     thread,
-    time::{Duration as StdDuration, Instant},
+    time::Duration as StdDuration,
 };
+#[cfg(not(test))]
+use std::{io::Write, sync::mpsc, time::Instant};
 use switching::{
     insert_switch_log, is_switchable, latest_switch_for_account, query_recent_switches_for_account,
     query_switch_logs, rollback_active_account, set_active_account,
@@ -1196,6 +1198,12 @@ fn init_database(connection: &Connection) -> Result<(), String> {
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 name TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS codex_visibility_archives (
+                thread_id TEXT PRIMARY KEY,
+                model_provider TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             ",
         )
@@ -3236,7 +3244,6 @@ fn query_session_records(connection: &Connection) -> Result<Vec<SessionRecord>, 
     backfill_codex_imported_session_titles(connection)?;
     backfill_codex_imported_session_owners(connection)?;
     backfill_codex_imported_state_model_providers(connection)?;
-    sync_codex_thread_visibility_for_active_owner(connection)?;
     let mut stmt = connection
         .prepare(
             "SELECT s.id, s.project_id, p.name, p.workspace_path, s.owner_account_id,
@@ -3244,8 +3251,7 @@ fn query_session_records(connection: &Connection) -> Result<Vec<SessionRecord>, 
                     s.raw_content, s.message_count, s.source_record_id, s.created_at, s.updated_at
              FROM session_records s
              JOIN local_projects p ON p.id = s.project_id
-             ORDER BY s.updated_at DESC, s.id DESC
-             LIMIT 100",
+             ORDER BY s.updated_at DESC, s.id DESC",
         )
         .map_err(|error| error.to_string())?;
 
@@ -3253,12 +3259,12 @@ fn query_session_records(connection: &Connection) -> Result<Vec<SessionRecord>, 
         .query_map([], map_session_record)
         .map_err(|error| error.to_string())?;
 
-    let main_thread_ids = if cfg!(test) {
+    let non_main_thread_ids = if cfg!(test) {
         None
     } else {
         codex_config_dir()
             .ok()
-            .and_then(|codex_dir| read_codex_main_thread_ids(&codex_dir).ok())
+            .and_then(|codex_dir| read_codex_non_main_thread_ids(&codex_dir).ok())
             .flatten()
     };
 
@@ -3267,7 +3273,7 @@ fn query_session_records(connection: &Connection) -> Result<Vec<SessionRecord>, 
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|record| !is_internal_codex_review_title(&record.title))
-        .filter(|record| is_main_codex_session_record(record, main_thread_ids.as_ref()))
+        .filter(|record| is_main_codex_session_record(record, non_main_thread_ids.as_ref()))
         .collect())
 }
 
@@ -3676,6 +3682,7 @@ fn count_codex_messages_in_rollout(path: &Path) -> i64 {
 }
 
 fn read_codex_state_threads(
+    connection: &Connection,
     codex_dir: &Path,
 ) -> Result<Option<Vec<ParsedCodexLocalSession>>, String> {
     let state_path = codex_dir.join("state_5.sqlite");
@@ -3687,9 +3694,8 @@ fn read_codex_state_threads(
         .map_err(|error| format!("读取 Codex state_5.sqlite 失败：{}", error))?;
     let mut stmt = state
         .prepare(
-            "SELECT id, title, cwd, model_provider, created_at, updated_at, rollout_path, source
+            "SELECT id, title, cwd, model_provider, created_at, updated_at, rollout_path, source, archived
              FROM threads
-             WHERE archived = 0
              ORDER BY updated_at DESC, id DESC",
         )
         .map_err(|error| format!("读取 Codex threads 失败：{}", error))?;
@@ -3704,34 +3710,51 @@ fn read_codex_state_threads(
             let rollout_path: String = row.get(6)?;
             let source: String = row.get(7)?;
             let title = raw_title.trim();
-            Ok(ParsedCodexLocalSession {
-                session_id,
-                workspace_path: workspace_path.clone(),
-                title: if title.is_empty() {
-                    codex_session_title(None, None, &workspace_path, None)
-                } else {
-                    title.to_string()
+            Ok((
+                ParsedCodexLocalSession {
+                    session_id,
+                    workspace_path: workspace_path.clone(),
+                    title: if title.is_empty() {
+                        codex_session_title(None, None, &workspace_path, None)
+                    } else {
+                        title.to_string()
+                    },
+                    updated_at: format_codex_unix_timestamp(updated_at),
+                    created_at: format_codex_unix_timestamp(created_at),
+                    message_count: 0,
+                    source_path: rollout_path,
+                    source,
+                    model_provider,
                 },
-                updated_at: format_codex_unix_timestamp(updated_at),
-                created_at: format_codex_unix_timestamp(created_at),
-                message_count: count_codex_messages_in_rollout(Path::new(&rollout_path)),
-                source_path: rollout_path,
-                source,
-                model_provider,
-            })
+                row.get::<_, i64>(8)?,
+            ))
         })
         .map_err(|error| format!("读取 Codex threads 行失败：{}", error))?;
 
-    let sessions = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|session| {
-            !session.session_id.trim().is_empty()
-                && !session.workspace_path.trim().is_empty()
-                && !is_internal_codex_review_title(&session.title)
-        })
-        .collect::<Vec<_>>();
+    let mut sessions = Vec::new();
+    for row in rows {
+        let (mut session, archived) = row.map_err(|error| error.to_string())?;
+        // Account isolation archives are still available in the Switcher library/import pool.
+        // User archives remain excluded and are never unarchived just by listing candidates.
+        if archived != 0
+            && !is_codex_visibility_archive(
+                connection,
+                &session.session_id,
+                &session.model_provider,
+            )?
+        {
+            continue;
+        }
+        if !session.session_id.trim().is_empty()
+            && !session.workspace_path.trim().is_empty()
+            && Path::new(&session.source_path).is_file()
+            && !is_internal_codex_review_title(&session.title)
+        {
+            session.message_count =
+                count_codex_messages_in_rollout(Path::new(&session.source_path));
+            sessions.push(session);
+        }
+    }
     Ok(Some(sessions))
 }
 
@@ -3739,7 +3762,7 @@ fn is_main_codex_thread_source(source: &str) -> bool {
     source.trim() == "vscode"
 }
 
-fn read_codex_main_thread_ids(codex_dir: &Path) -> Result<Option<HashSet<String>>, String> {
+fn read_codex_non_main_thread_ids(codex_dir: &Path) -> Result<Option<HashSet<String>>, String> {
     let state_path = codex_dir.join("state_5.sqlite");
     if !state_path.exists() {
         return Ok(None);
@@ -3748,11 +3771,11 @@ fn read_codex_main_thread_ids(codex_dir: &Path) -> Result<Option<HashSet<String>
     let state = Connection::open(&state_path)
         .map_err(|error| format!("读取 Codex state_5.sqlite 失败：{}", error))?;
     let mut stmt = state
-        .prepare("SELECT id FROM threads WHERE archived = 0 AND source = 'vscode'")
-        .map_err(|error| format!("读取 Codex main thread id 失败：{}", error))?;
+        .prepare("SELECT id FROM threads WHERE source != 'vscode'")
+        .map_err(|error| format!("读取 Codex 非主会话 id 失败：{}", error))?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| format!("读取 Codex main thread id 行失败：{}", error))?;
+        .map_err(|error| format!("读取 Codex 非主会话 id 行失败：{}", error))?;
     Ok(Some(
         rows.collect::<Result<HashSet<_>, _>>()
             .map_err(|error| error.to_string())?,
@@ -3773,16 +3796,18 @@ fn session_record_external_id(record: &SessionRecord) -> Option<String> {
 
 fn is_main_codex_session_record(
     record: &SessionRecord,
-    main_thread_ids: Option<&HashSet<String>>,
+    non_main_thread_ids: Option<&HashSet<String>>,
 ) -> bool {
     if record.record_type != "codex_imported" {
         return true;
     }
-    let Some(main_thread_ids) = main_thread_ids else {
+    let Some(non_main_thread_ids) = non_main_thread_ids else {
         return true;
     };
+    // A saved history record may outlive its rollout/index entry. Only exclude
+    // known non-main threads, not every record absent from the active sidebar.
     session_record_external_id(record)
-        .map(|id| main_thread_ids.contains(&id))
+        .map(|id| !non_main_thread_ids.contains(&id))
         .unwrap_or(true)
 }
 
@@ -3993,6 +4018,17 @@ fn sqlite_table_has_column(
                 table_name
             ),
             [column_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .map_err(|error| error.to_string())
+}
+
+fn sqlite_table_exists(connection: &Connection, table_name: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table_name],
             |row| row.get::<_, i64>(0),
         )
         .map(|count| count > 0)
@@ -4790,6 +4826,51 @@ fn backfill_codex_imported_state_model_providers(connection: &Connection) -> Res
     backfill_codex_imported_state_model_providers_for_dir(connection, &codex_dir)
 }
 
+fn is_codex_visibility_archive(
+    connection: &Connection,
+    thread_id: &str,
+    model_provider: &str,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT 1 FROM codex_visibility_archives
+             WHERE thread_id = ?1 AND model_provider = ?2",
+            params![thread_id, model_provider],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|marker| marker.is_some())
+        .map_err(|error| error.to_string())
+}
+
+fn mark_codex_visibility_archive(
+    connection: &Connection,
+    thread_id: &str,
+    model_provider: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO codex_visibility_archives (thread_id, model_provider, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_id) DO UPDATE SET
+                model_provider = excluded.model_provider,
+                created_at = excluded.created_at",
+            params![thread_id, model_provider, now_text()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn clear_codex_visibility_archive(connection: &Connection, thread_id: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM codex_visibility_archives WHERE thread_id = ?1",
+            [thread_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct CodexThreadArchiveAction {
     thread_id: String,
@@ -4860,12 +4941,14 @@ fn migrate_legacy_imported_rollout_path(
     Ok(target_path)
 }
 
+#[cfg(not(test))]
 fn write_codex_app_server_message(stdin: &mut impl Write, message: &Value) -> Result<(), String> {
     serde_json::to_writer(&mut *stdin, message).map_err(|error| error.to_string())?;
     stdin.write_all(b"\n").map_err(|error| error.to_string())?;
     stdin.flush().map_err(|error| error.to_string())
 }
 
+#[cfg(not(test))]
 fn wait_for_codex_app_server_response(
     receiver: &mpsc::Receiver<Value>,
     request_id: i64,
@@ -4931,10 +5014,77 @@ fn apply_codex_thread_archive_actions(
     codex_dir: &Path,
     actions: &[CodexThreadArchiveAction],
 ) -> Result<(), String> {
-    if actions.is_empty() || cfg!(test) {
+    if actions.is_empty() {
         return Ok(());
     }
 
+    #[cfg(test)]
+    {
+        apply_codex_thread_archive_actions_for_test(codex_dir, actions)
+    }
+
+    #[cfg(not(test))]
+    {
+        apply_codex_thread_archive_actions_via_server(codex_dir, actions)
+    }
+}
+
+#[cfg(test)]
+fn apply_codex_thread_archive_actions_for_test(
+    codex_dir: &Path,
+    actions: &[CodexThreadArchiveAction],
+) -> Result<(), String> {
+    let state_path = codex_dir.join("state_5.sqlite");
+    let state = Connection::open(&state_path)
+        .map_err(|error| format!("打开测试 Codex thread 索引失败：{}", error))?;
+    for action in actions {
+        let current_path = state
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = ?1 AND source = 'vscode'",
+                [action.thread_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(PathBuf::from)
+            .map_err(|error| error.to_string())?;
+        let file_name = current_path
+            .file_name()
+            .ok_or_else(|| format!("测试会话 {} 缺少 rollout 文件名", action.thread_id))?;
+        let (target_path, archived) = match action.method {
+            "thread/archive" => (codex_dir.join("archived_sessions").join(file_name), 1),
+            "thread/unarchive" => (codex_dir.join("sessions").join(file_name), 0),
+            method => return Err(format!("未知测试会话操作：{}", method)),
+        };
+        if current_path != target_path {
+            fs::create_dir_all(
+                target_path
+                    .parent()
+                    .ok_or_else(|| "测试 rollout 目标目录不存在".to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            if target_path.exists() {
+                fs::remove_file(&target_path).map_err(|error| error.to_string())?;
+            }
+            fs::rename(&current_path, &target_path).map_err(|error| error.to_string())?;
+        }
+        state
+            .execute(
+                "UPDATE threads
+                 SET archived = ?1,
+                     archived_at = CASE WHEN ?1 = 1 THEN strftime('%s', 'now') ELSE NULL END,
+                     rollout_path = ?2
+                 WHERE id = ?3 AND source = 'vscode'",
+                params![archived, target_path.to_string_lossy(), action.thread_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn apply_codex_thread_archive_actions_via_server(
+    codex_dir: &Path,
+    actions: &[CodexThreadArchiveAction],
+) -> Result<(), String> {
     let codex_cli = resolve_codex_cli_path()?;
     let mut child = Command::new(codex_cli)
         .args(["app-server", "--stdio"])
@@ -5035,6 +5185,262 @@ fn apply_codex_thread_archive_actions(
     result
 }
 
+fn reconcile_codex_visibility_archive_actions(
+    connection: &Connection,
+    codex_dir: &Path,
+    actions: &[CodexThreadArchiveAction],
+) -> Result<(), String> {
+    for action in actions {
+        if action.method == "thread/unarchive"
+            && codex_thread_archive_action_is_satisfied(codex_dir, action)
+        {
+            clear_codex_visibility_archive(connection, &action.thread_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn purge_missing_codex_threads_from_state(state_path: &Path) -> Result<usize, String> {
+    if !state_path.exists() {
+        return Ok(0);
+    }
+
+    let mut state = Connection::open(state_path)
+        .map_err(|error| format!("打开 Codex thread 索引失败：{}", error))?;
+    state
+        .busy_timeout(StdDuration::from_secs(5))
+        .map_err(|error| format!("等待 Codex thread 索引失败：{}", error))?;
+    state
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| format!("启用 Codex thread 索引外键失败：{}", error))?;
+
+    let missing_thread_ids = {
+        let mut stmt = state
+            .prepare("SELECT id, rollout_path FROM threads WHERE source = 'vscode'")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.filter_map(|row| row.ok())
+            .filter_map(|(thread_id, rollout_path)| {
+                (!Path::new(&rollout_path).exists()).then_some(thread_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    if missing_thread_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let has_spawn_edges = sqlite_table_exists(&state, "thread_spawn_edges")?;
+    let transaction = state
+        .transaction()
+        .map_err(|error| format!("开始清理 Codex thread 索引失败：{}", error))?;
+    for thread_id in &missing_thread_ids {
+        if has_spawn_edges {
+            transaction
+                .execute(
+                    "DELETE FROM thread_spawn_edges
+                     WHERE parent_thread_id = ?1 OR child_thread_id = ?1",
+                    [thread_id],
+                )
+                .map_err(|error| format!("清理 Codex thread 关联索引失败：{}", error))?;
+        }
+        transaction
+            .execute("DELETE FROM threads WHERE id = ?1", [thread_id])
+            .map_err(|error| format!("清理无文件 Codex thread 失败：{}", error))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交 Codex thread 索引清理失败：{}", error))?;
+    Ok(missing_thread_ids.len())
+}
+
+fn purge_missing_codex_thread_indexes(
+    codex_dir: &Path,
+    include_primary: bool,
+) -> Result<usize, String> {
+    let primary_state = codex_dir.join("state_5.sqlite");
+    let legacy_state = codex_dir.join("sqlite").join("state_5.sqlite");
+    let mut removed = 0;
+    if include_primary {
+        removed += purge_missing_codex_threads_from_state(&primary_state)?;
+    }
+    if legacy_state != primary_state {
+        removed += purge_missing_codex_threads_from_state(&legacy_state)?;
+    }
+    Ok(removed)
+}
+
+fn purge_missing_primary_codex_threads_with_cli(codex_dir: &Path) -> Result<usize, String> {
+    let state_path = codex_dir.join("state_5.sqlite");
+    if !state_path.exists() {
+        return Ok(0);
+    }
+    let state = Connection::open(&state_path)
+        .map_err(|error| format!("读取 Codex 主 thread 索引失败：{}", error))?;
+    state
+        .busy_timeout(StdDuration::from_secs(5))
+        .map_err(|error| format!("等待 Codex 主 thread 索引失败：{}", error))?;
+    let missing_thread_ids = {
+        let mut stmt = state
+            .prepare("SELECT id, rollout_path FROM threads WHERE source = 'vscode'")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.filter_map(|row| row.ok())
+            .filter_map(|(thread_id, rollout_path)| {
+                (!Path::new(&rollout_path).exists()).then_some(thread_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    drop(state);
+
+    if missing_thread_ids.is_empty() {
+        return Ok(0);
+    }
+    let codex_cli = resolve_codex_cli_path()?;
+    let mut removed = 0;
+    let mut errors = Vec::new();
+    for thread_id in missing_thread_ids {
+        let result = Command::new(&codex_cli)
+            .args(["delete", "--force", thread_id.as_str()])
+            .env("CODEX_HOME", codex_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        match result {
+            Ok(output) if output.status.success() => removed += 1,
+            Ok(output) => errors.push(format!(
+                "{}：{}",
+                thread_id,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => errors.push(format!("{}：{}", thread_id, error)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(removed)
+    } else {
+        Err(format!("清理无文件 Codex 会话失败：{}", errors.join("；")))
+    }
+}
+
+fn sync_codex_local_thread_catalog(codex_dir: &Path) -> Result<usize, String> {
+    let state_path = codex_dir.join("state_5.sqlite");
+    let catalog_path = codex_dir.join("sqlite").join("codex-dev.db");
+    if !state_path.exists() || !catalog_path.exists() {
+        return Ok(0);
+    }
+
+    let state = Connection::open(&state_path)
+        .map_err(|error| format!("读取 Codex 主 thread 索引失败：{}", error))?;
+    state
+        .busy_timeout(StdDuration::from_secs(5))
+        .map_err(|error| format!("等待 Codex 主 thread 索引失败：{}", error))?;
+    let visible_threads = {
+        let mut stmt = state
+            .prepare(
+                "SELECT id, title, created_at, updated_at, cwd, source, model_provider,
+                        git_branch, thread_source, recency_at, project_id, rollout_path
+                 FROM threads
+                 WHERE source = 'vscode' AND archived = 0",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.filter_map(|row| row.ok())
+            .filter(|row| Path::new(&row.11).exists())
+            .collect::<Vec<_>>()
+    };
+    drop(state);
+
+    let mut catalog = Connection::open(&catalog_path)
+        .map_err(|error| format!("读取 Codex 本地会话目录失败：{}", error))?;
+    catalog
+        .busy_timeout(StdDuration::from_secs(5))
+        .map_err(|error| format!("等待 Codex 本地会话目录失败：{}", error))?;
+    if !sqlite_table_exists(&catalog, "local_thread_catalog")? {
+        return Ok(0);
+    }
+    let observation_sequence = catalog
+        .query_row(
+            "SELECT COALESCE(MAX(observation_sequence), 0) + 1 FROM local_thread_catalog",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(1);
+    let transaction = catalog
+        .transaction()
+        .map_err(|error| format!("开始更新 Codex 本地会话目录失败：{}", error))?;
+    let removed = transaction
+        .execute(
+            "DELETE FROM local_thread_catalog
+             WHERE host_id = 'local' AND source_kind = 'vscode'",
+            [],
+        )
+        .map_err(|error| format!("清理 Codex 本地会话目录失败：{}", error))?;
+    for thread in visible_threads {
+        transaction
+            .execute(
+                "INSERT INTO local_thread_catalog
+                    (host_id, thread_id, display_title, source_created_at, source_updated_at,
+                     cwd, source_kind, source_detail, model_provider, git_branch,
+                     observation_sequence, missing_candidate, thread_source, source_recency_at,
+                     pending_observed_title, project_id, conversation_origin)
+                 VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, 0, ?10, ?11, 0, ?12, NULL)",
+                params![
+                    thread.0,
+                    thread.1,
+                    thread.2,
+                    thread.3,
+                    thread.4,
+                    thread.5,
+                    thread.6,
+                    thread.7,
+                    observation_sequence,
+                    thread.8,
+                    thread.9,
+                    thread.10,
+                ],
+            )
+            .map_err(|error| format!("写入 Codex 本地会话目录失败：{}", error))?;
+    }
+    if sqlite_table_exists(&transaction, "local_thread_catalog_metadata")? {
+        transaction
+            .execute(
+                "UPDATE local_thread_catalog_metadata
+                 SET catalog_revision = catalog_revision + 1 WHERE id = 1",
+                [],
+            )
+            .map_err(|error| format!("刷新 Codex 会话目录版本失败：{}", error))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交 Codex 本地会话目录失败：{}", error))?;
+    Ok(removed)
+}
+
 /// Codex has one global `state_5.sqlite` and one active `config.toml`.  Keep
 /// only threads that can be resolved by the active identity visible in that
 /// shared index; otherwise Codex renders stale threads but cannot open them
@@ -5044,6 +5450,16 @@ fn sync_codex_thread_visibility_for_owner(
     codex_dir: &Path,
     owner: &SessionOwner,
 ) -> Result<(), String> {
+    // Some Codex versions leave an older index at `sqlite/state_5.sqlite`.
+    // The desktop app imports that index again at startup, so stale rows with
+    // deleted rollout files must be removed from both locations. Never mutate
+    // the active primary index while the desktop process is running.
+    let desktop_running = !cfg!(test) && codex_desktop_app_is_running();
+    purge_missing_codex_thread_indexes(codex_dir, !desktop_running)?;
+    if desktop_running {
+        purge_missing_primary_codex_threads_with_cli(codex_dir)?;
+    }
+
     let state_path = codex_dir.join("state_5.sqlite");
     if !state_path.exists() {
         return Ok(());
@@ -5142,6 +5558,8 @@ fn sync_codex_thread_visibility_for_owner(
         )?;
         let rollout_exists = rollout_path.exists();
         let rollout_is_archived = rollout_path.starts_with(&archived_sessions_dir);
+        let switcher_archived =
+            is_codex_visibility_archive(connection, &thread_id, &model_provider)?;
 
         if visible {
             if let Some(expected_provider) = expected_provider.as_deref() {
@@ -5171,22 +5589,37 @@ fn sync_codex_thread_visibility_for_owner(
                          SET archived = 1,
                              archived_at = CASE WHEN archived = 0 THEN strftime('%s', 'now') ELSE archived_at END
                          WHERE id = ?1 AND source = 'vscode'",
-                        [thread_id],
+                        [thread_id.as_str()],
                     )
                     .map_err(|error| error.to_string())?;
-            } else if rollout_is_archived {
+                clear_codex_visibility_archive(connection, &thread_id)?;
+            } else if rollout_is_archived && switcher_archived {
                 archive_actions.push(CodexThreadArchiveAction {
                     thread_id,
                     method: "thread/unarchive",
                 });
+            } else if rollout_is_archived {
+                // This thread was archived by the user or by Codex itself,
+                // rather than by identity isolation. Keep it archived even
+                // when its owner becomes active again.
+                state
+                    .execute(
+                        "UPDATE threads
+                         SET archived = 1,
+                             archived_at = COALESCE(archived_at, strftime('%s', 'now'))
+                         WHERE id = ?1 AND source = 'vscode'",
+                        [thread_id.as_str()],
+                    )
+                    .map_err(|error| error.to_string())?;
             } else {
                 state
                     .execute(
                         "UPDATE threads SET archived = 0, archived_at = NULL
                          WHERE id = ?1 AND source = 'vscode'",
-                        [thread_id],
+                        [thread_id.as_str()],
                     )
                     .map_err(|error| error.to_string())?;
+                clear_codex_visibility_archive(connection, &thread_id)?;
             }
         } else {
             if rollout_exists && !rollout_is_archived {
@@ -5194,6 +5627,7 @@ fn sync_codex_thread_visibility_for_owner(
                 // Switcher build already set archived=1 directly. The file
                 // must also leave `sessions`, otherwise paginated history is
                 // rediscovered during the next desktop startup.
+                mark_codex_visibility_archive(connection, &thread_id, &model_provider)?;
                 archive_actions.push(CodexThreadArchiveAction {
                     thread_id,
                     method: "thread/archive",
@@ -5205,15 +5639,22 @@ fn sync_codex_thread_visibility_for_owner(
                          SET archived = 1,
                              archived_at = CASE WHEN archived = 0 THEN strftime('%s', 'now') ELSE archived_at END
                          WHERE id = ?1 AND source = 'vscode'",
-                        [thread_id],
+                        [thread_id.as_str()],
                     )
                     .map_err(|error| error.to_string())?;
+                if !rollout_exists {
+                    clear_codex_visibility_archive(connection, &thread_id)?;
+                }
             }
         }
     }
 
     drop(state);
-    apply_codex_thread_archive_actions(codex_dir, &archive_actions)
+    let action_result = apply_codex_thread_archive_actions(codex_dir, &archive_actions);
+    let reconcile_result =
+        reconcile_codex_visibility_archive_actions(connection, codex_dir, &archive_actions);
+    let catalog_result = sync_codex_local_thread_catalog(codex_dir).map(|_| ());
+    action_result.and(reconcile_result).and(catalog_result)
 }
 
 fn sync_codex_thread_visibility_for_active_owner(connection: &Connection) -> Result<(), String> {
@@ -5398,6 +5839,21 @@ fn candidate_identity_for_session(
         }
     }
 
+    // Scoped providers encode the exact Key, including when several Keys share a host.
+    if let Some(profile_id) = session
+        .model_provider
+        .trim()
+        .strip_prefix("codexswitcher-key-")
+    {
+        if let Ok(profile_id) = profile_id.parse::<i64>() {
+            return identity_from_owner_ref(
+                connection,
+                "third_party_key",
+                &format!("key:{profile_id}"),
+            );
+        }
+    }
+
     if !is_official_codex_model_provider(&session.model_provider) {
         if let Some(identity) = infer_custom_candidate_identity_from_source(
             connection,
@@ -5445,7 +5901,7 @@ fn list_codex_local_session_candidates_from_dir(
     connection: &Connection,
     codex_dir: &Path,
 ) -> Result<Vec<CodexLocalSessionCandidate>, String> {
-    let sessions = if let Some(sessions) = read_codex_state_threads(codex_dir)? {
+    let sessions = if let Some(sessions) = read_codex_state_threads(connection, codex_dir)? {
         sessions
     } else {
         let index = read_codex_session_index(codex_dir)?;
@@ -5553,7 +6009,7 @@ fn import_codex_local_session_candidates_from_dir(
         profile_ref: "local".to_string(),
     });
     let requested_ids = candidate_ids.iter().cloned().collect::<HashSet<_>>();
-    if let Some(sessions) = read_codex_state_threads(codex_dir)? {
+    if let Some(sessions) = read_codex_state_threads(connection, codex_dir)? {
         let mut scanned_files = 0_i64;
         let mut imported_sessions = 0_i64;
         let mut updated_sessions = 0_i64;
@@ -9139,7 +9595,8 @@ mod tests {
                     thread_source TEXT,
                     preview TEXT NOT NULL DEFAULT '',
                     recency_at INTEGER NOT NULL DEFAULT 0,
-                    recency_at_ms INTEGER NOT NULL DEFAULT 0
+                    recency_at_ms INTEGER NOT NULL DEFAULT 0,
+                    project_id TEXT
                 );",
             )
             .expect("create threads table");
@@ -10857,7 +11314,7 @@ mod tests {
             ),
         ] {
             let rollout_path = root.join(format!("{id}.jsonl"));
-            if id == "key-a-thread" {
+            if id != "missing-key-a-thread" {
                 fs::write(&rollout_path, "{}\n").expect("write visibility rollout");
             }
             state
@@ -10893,18 +11350,33 @@ mod tests {
         assert_eq!(archived("key-a-thread"), 0);
         assert_eq!(archived("key-b-thread"), 1);
         assert_eq!(archived("official-thread"), 1);
-        assert_eq!(archived("missing-key-a-thread"), 1);
+        let missing_count: i64 = state
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'missing-key-a-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count missing rollout thread");
+        assert_eq!(missing_count, 0);
         drop(state);
+
+        let candidates = list_codex_local_session_candidates_from_dir(&connection, &root)
+            .expect("list visible and isolation-archived sessions");
+        assert_eq!(candidates.len(), 3);
+        for (thread_id, key) in [("key-a-thread", &first_key), ("key-b-thread", &second_key)] {
+            let candidate = candidates
+                .iter()
+                .find(|item| item.candidate_id == thread_id)
+                .expect("both Keys remain available in the manager");
+            assert_eq!(candidate.identity_key, format!("key:{}", key.id));
+            assert_eq!(candidate.identity_label, key.nickname);
+        }
 
         let official_owner = SessionOwner {
             account_id: Some(1),
             profile_kind: "official_account".to_string(),
             profile_ref: "account:1".to_string(),
         };
-        fs::remove_file(root.join("key-a-thread.jsonl"))
-            .expect("hide first key rollout in test mode");
-        fs::write(root.join("official-thread.jsonl"), "{}\n")
-            .expect("restore official visibility rollout");
         sync_codex_thread_visibility_for_owner(&connection, &root, &official_owner)
             .expect("show official threads only");
         let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
@@ -10924,6 +11396,278 @@ mod tests {
             .expect("read official archived state");
         assert_eq!(key_a_archived, 1);
         assert_eq!(official_archived, 0);
+        assert_eq!(
+            list_codex_local_session_candidates_from_dir(&connection, &root)
+                .expect("list candidates after official switch")
+                .len(),
+            3
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_identity_visibility_keeps_user_archived_thread_archived() {
+        let connection = setup_test_connection();
+        let key_profile = create_key_profile_record(
+            &connection,
+            CreateKeyProfileInput {
+                provider: "taomu".to_string(),
+                nickname: "桃木 Key".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                model: "gpt-5-codex".to_string(),
+                api_key: "example-api-key-1234567890abcdef".to_string(),
+            },
+            "keychain://user-archived-visibility-key",
+        )
+        .expect("create key profile");
+
+        let root = std::env::temp_dir().join(format!(
+            "codexswitcher-user-archived-visibility-test-{}-{}",
+            std::process::id(),
+            now_text().replace([' ', ':'], "-")
+        ));
+        let state = create_codex_state_db(&root);
+        let archived_dir = root.join("archived_sessions");
+        fs::create_dir_all(&archived_dir).expect("create archived sessions dir");
+        let rollout_path =
+            archived_dir.join("rollout-2026-08-28T10-00-00-user-archived-thread.jsonl");
+        fs::write(&rollout_path, "{}\n").expect("write user archived rollout");
+        state
+            .execute(
+                "INSERT INTO threads
+                    (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                     sandbox_policy, approval_mode, tokens_used, has_user_event, archived,
+                     archived_at, cli_version, first_user_message, memory_mode)
+                 VALUES ('user-archived-thread', ?1, 1787882400, 1787882460, 'vscode', ?2,
+                         '/tmp/project', '用户主动归档', 'workspace-write', 'on-request', 0, 1, 1,
+                         1787882460, 'test', '', 'enabled')",
+                params![
+                    rollout_path.to_string_lossy(),
+                    key_profile_model_provider(&key_profile)
+                ],
+            )
+            .expect("insert user archived thread");
+        drop(state);
+
+        let owner = SessionOwner {
+            account_id: None,
+            profile_kind: "third_party_key".to_string(),
+            profile_ref: format!("key:{}", key_profile.id),
+        };
+        sync_codex_thread_visibility_for_owner(&connection, &root, &owner)
+            .expect("keep user archive hidden");
+
+        let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
+        let (archived, current_path): (i64, String) = state
+            .query_row(
+                "SELECT archived, rollout_path FROM threads WHERE id = 'user-archived-thread'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read user archived thread");
+        assert_eq!(archived, 1);
+        assert_eq!(current_path, rollout_path.to_string_lossy());
+        assert!(rollout_path.exists());
+        assert!(!is_codex_visibility_archive(
+            &connection,
+            "user-archived-thread",
+            &key_profile_model_provider(&key_profile)
+        )
+        .expect("read visibility marker"));
+
+        assert!(
+            list_codex_local_session_candidates_from_dir(&connection, &root)
+                .expect("list candidates without user archives")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_rollout_threads_are_removed_from_primary_and_legacy_indexes() {
+        let root = std::env::temp_dir().join(format!(
+            "codexswitcher-missing-rollout-index-test-{}-{}",
+            std::process::id(),
+            now_text().replace([' ', ':'], "-")
+        ));
+        let existing_rollout = root.join("sessions/existing-thread.jsonl");
+        fs::create_dir_all(existing_rollout.parent().expect("rollout parent"))
+            .expect("create rollout dir");
+        fs::write(&existing_rollout, "{}\n").expect("write existing rollout");
+
+        for (state_root, missing_id) in [
+            (root.clone(), "missing-primary-thread"),
+            (root.join("sqlite"), "missing-legacy-thread"),
+        ] {
+            let state = create_codex_state_db(&state_root);
+            for (thread_id, rollout_path) in [
+                (
+                    missing_id,
+                    root.join(format!("sessions/{missing_id}.jsonl")),
+                ),
+                ("existing-thread", existing_rollout.clone()),
+            ] {
+                state
+                    .execute(
+                        "INSERT INTO threads
+                            (id, rollout_path, created_at, updated_at, source, model_provider, cwd,
+                             title, sandbox_policy, approval_mode, archived, cli_version,
+                             first_user_message, memory_mode)
+                         VALUES (?1, ?2, 1787882400, 1787882460, 'vscode', 'openai', '/tmp', ?1,
+                                 'workspace-write', 'on-request', 0, 'test', '', 'enabled')",
+                        params![thread_id, rollout_path.to_string_lossy()],
+                    )
+                    .expect("insert indexed thread");
+            }
+        }
+
+        let removed =
+            purge_missing_codex_thread_indexes(&root, true).expect("purge missing indexes");
+        assert_eq!(removed, 2);
+        for state_path in [
+            root.join("state_5.sqlite"),
+            root.join("sqlite/state_5.sqlite"),
+        ] {
+            let state = Connection::open(state_path).expect("open cleaned state");
+            let ids = state
+                .prepare("SELECT id FROM threads ORDER BY id")
+                .expect("prepare thread ids")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query thread ids")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect thread ids");
+            assert_eq!(ids, vec!["existing-thread".to_string()]);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_thread_catalog_contains_only_visible_threads_with_rollouts() {
+        let root = std::env::temp_dir().join(format!(
+            "codexswitcher-local-thread-catalog-test-{}-{}",
+            std::process::id(),
+            now_text().replace([' ', ':'], "-")
+        ));
+        let valid_rollout = root.join("sessions/valid-thread.jsonl");
+        let archived_rollout = root.join("archived_sessions/archived-thread.jsonl");
+        fs::create_dir_all(valid_rollout.parent().expect("valid rollout parent"))
+            .expect("create sessions dir");
+        fs::create_dir_all(archived_rollout.parent().expect("archived rollout parent"))
+            .expect("create archived sessions dir");
+        fs::write(&valid_rollout, "{}\n").expect("write valid rollout");
+        fs::write(&archived_rollout, "{}\n").expect("write archived rollout");
+
+        let state = create_codex_state_db(&root);
+        for (thread_id, title, rollout_path, archived) in [
+            ("valid-thread", "有效会话", valid_rollout.clone(), 0),
+            ("archived-thread", "已归档会话", archived_rollout.clone(), 1),
+            (
+                "missing-thread",
+                "已删除会话",
+                root.join("sessions/missing-thread.jsonl"),
+                0,
+            ),
+        ] {
+            state
+                .execute(
+                    "INSERT INTO threads
+                        (id, rollout_path, created_at, updated_at, source, model_provider, cwd,
+                         title, sandbox_policy, approval_mode, archived, archived_at, cli_version,
+                         first_user_message, memory_mode, recency_at)
+                     VALUES (?1, ?2, 1787882400, 1787882460, 'vscode', 'codexswitcher-key-9',
+                             '/tmp/project', ?3, 'workspace-write', 'on-request', ?4,
+                             CASE WHEN ?4 = 1 THEN 1787882460 ELSE NULL END, 'test', '',
+                             'enabled', 1787882460)",
+                    params![thread_id, rollout_path.to_string_lossy(), title, archived],
+                )
+                .expect("insert catalog source thread");
+        }
+        drop(state);
+
+        let catalog_dir = root.join("sqlite");
+        fs::create_dir_all(&catalog_dir).expect("create catalog dir");
+        let catalog =
+            Connection::open(catalog_dir.join("codex-dev.db")).expect("open local thread catalog");
+        catalog
+            .execute_batch(
+                "CREATE TABLE local_thread_catalog (
+                    host_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    display_title TEXT NOT NULL,
+                    source_created_at REAL NOT NULL,
+                    source_updated_at REAL NOT NULL,
+                    cwd TEXT,
+                    source_kind TEXT NOT NULL,
+                    source_detail TEXT,
+                    model_provider TEXT,
+                    git_branch TEXT,
+                    observation_sequence INTEGER NOT NULL,
+                    missing_candidate INTEGER NOT NULL DEFAULT 0,
+                    thread_source TEXT,
+                    source_recency_at REAL NOT NULL DEFAULT 0,
+                    pending_observed_title INTEGER NOT NULL DEFAULT 0,
+                    project_id TEXT,
+                    conversation_origin TEXT,
+                    PRIMARY KEY (host_id, thread_id)
+                );
+                CREATE TABLE local_thread_catalog_metadata (
+                    id INTEGER PRIMARY KEY,
+                    catalog_revision INTEGER NOT NULL
+                );
+                INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 7);
+                INSERT INTO local_thread_catalog
+                    (host_id, thread_id, display_title, source_created_at, source_updated_at,
+                     source_kind, observation_sequence, missing_candidate, source_recency_at,
+                     pending_observed_title)
+                VALUES
+                    ('local', 'stale-thread', '幽灵会话', 1, 1, 'vscode', 3, 0, 1, 0),
+                    ('local', 'archived-thread', '已归档会话', 1, 1, 'vscode', 3, 0, 1, 0),
+                    ('local', 'cli-thread', '命令行会话', 1, 1, 'cli', 3, 0, 1, 0);",
+            )
+            .expect("seed local thread catalog");
+        drop(catalog);
+
+        let removed = sync_codex_local_thread_catalog(&root).expect("sync local thread catalog");
+        assert_eq!(removed, 2);
+
+        let catalog = Connection::open(catalog_dir.join("codex-dev.db"))
+            .expect("reopen local thread catalog");
+        let vscode_rows = catalog
+            .prepare(
+                "SELECT thread_id, display_title FROM local_thread_catalog
+                 WHERE host_id = 'local' AND source_kind = 'vscode' ORDER BY thread_id",
+            )
+            .expect("prepare visible catalog rows")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query visible catalog rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect visible catalog rows");
+        assert_eq!(
+            vscode_rows,
+            vec![("valid-thread".to_string(), "有效会话".to_string())]
+        );
+        let cli_count: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog
+                 WHERE host_id = 'local' AND thread_id = 'cli-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count preserved cli catalog row");
+        assert_eq!(cli_count, 1);
+        let revision: i64 = catalog
+            .query_row(
+                "SELECT catalog_revision FROM local_thread_catalog_metadata WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read catalog revision");
+        assert_eq!(revision, 8);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11034,6 +11778,46 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_library_preserves_history_beyond_active_index_and_first_hundred() {
+        let connection = setup_test_connection();
+        let owner = SessionOwner {
+            account_id: None,
+            profile_kind: "third_party_key".to_string(),
+            profile_ref: "key:9".to_string(),
+        };
+        for index in 0..105 {
+            let session = ParsedCodexLocalSession {
+                session_id: format!("history-{index}"),
+                workspace_path: "/tmp/library".to_string(),
+                title: format!("历史会话 {index}"),
+                created_at: now_text(),
+                updated_at: now_text(),
+                message_count: 1,
+                source_path: "/missing/old-rollout.jsonl".to_string(),
+                source: "vscode".to_string(),
+                model_provider: "custom".to_string(),
+            };
+            upsert_codex_imported_session(&connection, &session, &owner, true)
+                .expect("store history");
+        }
+        let records = query_session_records(&connection)
+            .expect("query full library")
+            .into_iter()
+            .filter(|record| record.record_type == "codex_imported")
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 105);
+        let non_main_ids = HashSet::from(["history-0".to_string()]);
+        let retained = records
+            .iter()
+            .filter(|record| is_main_codex_session_record(record, Some(&non_main_ids)))
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 104);
+        assert!(retained
+            .iter()
+            .all(|record| session_record_external_id(record).as_deref() != Some("history-0")));
     }
 
     #[test]
@@ -11200,6 +11984,32 @@ mod tests {
             )
             .expect("insert imported record");
 
+        let state = Connection::open(root.join("state_5.sqlite")).expect("open state");
+        state
+            .execute(
+                "UPDATE threads SET source = 'vscode' WHERE id = 'reassign-thread'",
+                [],
+            )
+            .expect("make source a main thread");
+        drop(state);
+        mark_codex_visibility_archive(&connection, "reassign-thread", "custom")
+            .expect("mark isolation archive");
+        apply_codex_thread_archive_actions(
+            &root,
+            &[CodexThreadArchiveAction {
+                thread_id: "reassign-thread".to_string(),
+                method: "thread/archive",
+            }],
+        )
+        .expect("archive other Key source");
+        let candidates = list_codex_local_session_candidates_from_dir(&connection, &root)
+            .expect("list archived import source");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].identity_key,
+            format!("key:{}", yuchat_profile.id)
+        );
+
         let result = import_codex_local_session_candidates_from_dir(
             &connection,
             &root,
@@ -11262,6 +12072,16 @@ mod tests {
             .expect("copied external session id");
         assert_ne!(copied_session_id, "reassign-thread");
         let state = Connection::open(root.join("state_5.sqlite")).expect("open state db");
+        assert_eq!(
+            state
+                .query_row(
+                    "SELECT archived FROM threads WHERE id = 'reassign-thread'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("read source archive state"),
+            1
+        );
         let original_provider: String = state
             .query_row(
                 "SELECT model_provider FROM threads WHERE id = 'reassign-thread'",
@@ -11824,14 +12644,15 @@ mod tests {
     }
 
     #[test]
-    fn read_real_usage_for_bound_account_returns_none_without_real_snapshot() {
+    fn read_real_usage_for_bound_account_errors_without_available_session() {
         let connection = setup_test_connection();
         connection
             .execute("DELETE FROM usage_snapshots WHERE account_id = 1", [])
             .expect("clear account snapshots");
+        // Disable the Keychain fallback so this fixture has no available session.
         connection
             .execute(
-                "UPDATE accounts SET is_real_session = 1, binding_kind = 'codex_cli', auth_state = 'valid', status = 'healthy', session_ref = 'missing-profile.json', updated_at = ?1 WHERE id = 1",
+                "UPDATE accounts SET is_real_session = 1, binding_kind = 'codex_cli', auth_state = 'valid', status = 'healthy', session_ref = 'missing-profile.json', account_key = '', updated_at = ?1 WHERE id = 1",
                 params![now_text()],
             )
             .expect("mark account real");

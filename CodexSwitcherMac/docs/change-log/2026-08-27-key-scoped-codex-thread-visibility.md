@@ -5,6 +5,9 @@
 - Codex 重载：最新版 Codex 会在进程内缓存当前 provider 与侧栏线程。Switcher 完成身份切换和可见性写入后，如果 Codex 正在运行，会自动退出并重新打开，让新配置和会话过滤同时生效。
 - 会话归档协议：新版 `history_mode=paginated` 会话会在 Codex 启动时从 `sessions` 目录重新发现，仅修改 `state_5.sqlite.archived` 不足以隐藏。Switcher 现在通过 Codex app-server 的 `thread/archive` 和 `thread/unarchive` 官方协议移动 rollout 文件并更新索引，避免其他 Key 或官方会话在重启后再次出现。旧版 Switcher 创建在 `sessions/codexswitcher-imported` 下的非标准 rollout 文件会先迁移为 Codex 认可的日期目录和文件名，再参与归档；单条会话失败不会再跳过后续整批会话。
 - 无效索引处理：如果 `state_5.sqlite` 仍有 thread 记录，但对应 rollout 文件已经不存在，该记录会保持隐藏。此类记录无法恢复或打开，继续显示只会形成不可点击的侧栏死记录。
+- 用户归档保护：Switcher 使用独立的 `codex_visibility_archives` 表记录“为了账号隔离而临时归档”的 thread。切回身份时只恢复带有该标记的会话；用户在 Codex 中主动归档、Codex 自身归档或历史版本留下但无法确认来源的归档会话始终保持归档，不会再被账号切换带回普通侧栏。
+- 多索引清理：部分 Codex 版本同时保留 `~/.codex/state_5.sqlite` 和旧的 `~/.codex/sqlite/state_5.sqlite`。旧索引中的无 rollout 记录会在 Codex 重启时再次导入并形成 `no rollout found` 幽灵会话。Switcher 现在会清理两套索引中已经没有 rollout 文件的 thread；运行中的主索引不会被直接修改，Codex 退出后再安全清理。
+- 侧栏目录同步：新版 Codex 的侧栏还读取 `~/.codex/sqlite/codex-dev.db` 中的 `local_thread_catalog`，它可能在 state thread 已删除后继续保留标题。Switcher 会用主 state 中“未归档且 rollout 文件存在”的当前可见会话重建本地侧栏目录，并递增目录版本；已删除、已归档、其他身份和无文件会话不再留在侧栏目录中。
 - 涉及范围：第三方 Key 运行配置、Codex thread 写回、已导入线程的 provider 回填、Codex 侧边栏可见性。
 - 是否影响配置：会在下次启用第三方 Key 时重写 `config.toml`。`model_provider` 使用 Key 专属内部标识，`model_providers.<id>.name` 继续使用供应商名称，因此 Codex 底部不会显示内部编号。
 - 是否影响接口或使用方式：无接口变化。用户切换 Key 后，Codex 侧边栏只会展示当前 Key 的历史记录；官方模式只展示官方记录。
