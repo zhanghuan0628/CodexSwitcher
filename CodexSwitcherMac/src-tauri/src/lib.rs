@@ -4071,6 +4071,18 @@ fn refresh_codex_state_thread_visibility_metadata(
     updated_at: i64,
     updated_at_ms: i64,
 ) -> Result<(), String> {
+    // Newer Codex builds hydrate paginated rollouts through `thread/resume`.
+    // Imported rows created with the table default (`legacy`) make the app
+    // request the removed `list_turns` endpoint instead.
+    if sqlite_table_has_column(state, "threads", "history_mode")? {
+        state
+            .execute(
+                "UPDATE threads SET history_mode = 'paginated' WHERE id = ?1",
+                [session_id],
+            )
+            .map_err(|error| format!("更新 Codex thread 历史模式失败：{}", error))?;
+    }
+
     if sqlite_table_has_column(state, "threads", "thread_source")? {
         state
             .execute(
@@ -9596,6 +9608,7 @@ mod tests {
                     preview TEXT NOT NULL DEFAULT '',
                     recency_at INTEGER NOT NULL DEFAULT 0,
                     recency_at_ms INTEGER NOT NULL DEFAULT 0,
+                    history_mode TEXT NOT NULL DEFAULT 'legacy',
                     project_id TEXT
                 );",
             )
@@ -11137,10 +11150,11 @@ mod tests {
             String,
             i64,
             i64,
+            String,
         ) = state
             .query_row(
                 "SELECT title, cwd, archived, first_user_message, model_provider,
-                        thread_source, preview, recency_at, recency_at_ms
+                        thread_source, preview, recency_at, recency_at_ms, history_mode
                  FROM threads WHERE id = 'register-thread'",
                 [],
                 |row| {
@@ -11154,6 +11168,7 @@ mod tests {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -11167,6 +11182,7 @@ mod tests {
         assert_eq!(synced.6, "同步到 Codex");
         assert_eq!(synced.7, 1777176060);
         assert_eq!(synced.8, 1777176060000);
+        assert_eq!(synced.9, "paginated");
         let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
         let first_line = rollout_content.lines().next().expect("rollout meta line");
         let meta: Value = serde_json::from_str(first_line).expect("parse rollout meta");
@@ -11256,6 +11272,14 @@ mod tests {
             model_provider,
             format!("codexswitcher-key-{}", key_profile.id)
         );
+        let history_mode: String = state
+            .query_row(
+                "SELECT history_mode FROM threads WHERE id = 'existing-key-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query history mode");
+        assert_eq!(history_mode, "paginated");
 
         let rollout_content = fs::read_to_string(&rollout_path).expect("read rollout after sync");
         let first_line = rollout_content.lines().next().expect("rollout meta line");
