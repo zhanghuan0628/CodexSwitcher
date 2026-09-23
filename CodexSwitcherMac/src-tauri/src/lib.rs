@@ -4795,7 +4795,11 @@ fn backfill_codex_imported_state_model_providers_for_dir(
             continue;
         }
 
-        if model_provider != expected_provider
+        let provider_matches_owner = model_provider == expected_provider;
+        let provider_is_scoped_to_another_key =
+            is_key_scoped_codex_model_provider(&model_provider) && !provider_matches_owner;
+        if !provider_matches_owner
+            && !provider_is_scoped_to_another_key
             && state
                 .execute(
                     "UPDATE threads
@@ -4823,7 +4827,7 @@ fn backfill_codex_imported_state_model_providers_for_dir(
             continue;
         }
 
-        if rollout_path.exists() {
+        if rollout_path.exists() && !provider_is_scoped_to_another_key {
             let _ = sync_rollout_session_meta_model_provider(rollout_path, &expected_provider);
         }
     }
@@ -5478,27 +5482,6 @@ fn sync_codex_thread_visibility_for_owner(
     }
 
     let expected_provider = codex_model_provider_for_owner(connection, codex_dir, owner, false);
-    let visible_imported_ids = {
-        let mut stmt = connection
-            .prepare(
-                "SELECT external_session_id
-                 FROM session_records
-                 WHERE record_type = 'codex_imported'
-                   AND owner_profile_kind = ?1
-                   AND owner_profile_ref = ?2
-                   AND external_session_id IS NOT NULL
-                   AND TRIM(external_session_id) != ''",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map(params![owner.profile_kind, owner.profile_ref], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|error| error.to_string())?;
-        rows.collect::<Result<HashSet<_>, _>>()
-            .map_err(|error| error.to_string())?
-    };
-
     let legacy_provider = if owner.profile_kind == "third_party_key" {
         let profile_id = owner
             .profile_ref
@@ -5556,8 +5539,7 @@ fn sync_codex_thread_visibility_for_owner(
     for (thread_id, model_provider, archived, rollout_path, created_at) in threads {
         let is_current_official = owner.profile_kind == "official_account"
             && is_official_codex_model_provider(&model_provider);
-        let is_current_key = expected_provider.as_deref() == Some(model_provider.as_str())
-            || visible_imported_ids.contains(&thread_id);
+        let is_current_key = expected_provider.as_deref() == Some(model_provider.as_str());
         let is_unambiguous_legacy_key = legacy_provider.as_deref() == Some(model_provider.trim());
         let visible = is_current_official || is_current_key || is_unambiguous_legacy_key;
 
@@ -5576,7 +5558,7 @@ fn sync_codex_thread_visibility_for_owner(
         if visible {
             if let Some(expected_provider) = expected_provider.as_deref() {
                 if owner.profile_kind == "third_party_key"
-                    && (visible_imported_ids.contains(&thread_id) || is_unambiguous_legacy_key)
+                    && is_unambiguous_legacy_key
                     && model_provider != expected_provider
                 {
                     state
@@ -5838,6 +5820,13 @@ fn active_official_candidate_identity(
 
 fn is_official_codex_model_provider(model_provider: &str) -> bool {
     model_provider.trim().eq_ignore_ascii_case("openai")
+}
+
+fn is_key_scoped_codex_model_provider(model_provider: &str) -> bool {
+    model_provider
+        .trim()
+        .strip_prefix("codexswitcher-key-")
+        .is_some_and(|profile_id| profile_id.parse::<i64>().is_ok())
 }
 
 fn candidate_identity_for_session(
